@@ -1,0 +1,11 @@
+/target
+/data
+*.sqlite
+*.db
+.env
+.env.*
+.DS_Store
+
+# IDE
+.idea
+.vscode
