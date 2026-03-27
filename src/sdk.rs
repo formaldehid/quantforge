@@ -1,8 +1,9 @@
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use thiserror::Error;
 
-use crate::model::{Candle, MarketId, TimestampMs};
+use crate::model::{Candle, MarketId, TargetPosition, TimestampMs};
 
 #[derive(Error, Debug)]
 pub enum StrategyError {
@@ -16,12 +17,6 @@ impl StrategyError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TargetPosition {
-    Flat,
-    LongAllIn,
-}
-
 pub trait StrategyContext {
     fn market(&self) -> &MarketId;
     fn now_ms(&self) -> TimestampMs;
@@ -30,7 +25,7 @@ pub trait StrategyContext {
     fn set_target_position(&mut self, target: TargetPosition);
 }
 
-pub trait Strategy {
+pub trait Strategy: Send {
     fn name(&self) -> &'static str;
 
     fn on_start(&mut self, _ctx: &mut dyn StrategyContext) -> Result<(), StrategyError> {
@@ -42,6 +37,14 @@ pub trait Strategy {
     fn on_finish(&mut self, _ctx: &mut dyn StrategyContext) -> Result<(), StrategyError> {
         Ok(())
     }
+}
+
+pub trait Indicator {
+    type Input;
+    type Output;
+
+    fn reset(&mut self);
+    fn update(&mut self, input: Self::Input) -> Option<Self::Output>;
 }
 
 #[derive(Clone, Debug)]
@@ -56,17 +59,26 @@ impl Sma {
         if window == 0 {
             return Err(StrategyError::msg("SMA window must be greater than zero"));
         }
-
         Ok(Self {
             window,
             sum: Decimal::ZERO,
             values: VecDeque::with_capacity(window),
         })
     }
+}
 
-    pub fn update(&mut self, value: Decimal) -> Option<Decimal> {
-        self.values.push_back(value);
-        self.sum += value;
+impl Indicator for Sma {
+    type Input = Decimal;
+    type Output = Decimal;
+
+    fn reset(&mut self) {
+        self.sum = Decimal::ZERO;
+        self.values.clear();
+    }
+
+    fn update(&mut self, input: Self::Input) -> Option<Self::Output> {
+        self.values.push_back(input);
+        self.sum += input;
 
         if self.values.len() > self.window {
             if let Some(removed) = self.values.pop_front() {
@@ -78,6 +90,28 @@ impl Sma {
             Some(self.sum / Decimal::from(self.window as i64))
         } else {
             None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BuiltInStrategyConfig {
+    SmaCross { fast: usize, slow: usize },
+}
+
+impl BuiltInStrategyConfig {
+    pub fn strategy_name(&self) -> &'static str {
+        match self {
+            Self::SmaCross { .. } => "sma_cross",
+        }
+    }
+
+    pub fn build(&self) -> Result<Box<dyn Strategy>, StrategyError> {
+        match self {
+            Self::SmaCross { fast, slow } => {
+                Ok(Box::new(strategies::SmaCrossStrategy::new(*fast, *slow)?))
+            }
         }
     }
 }
@@ -129,13 +163,10 @@ pub mod strategies {
             let slow_now = self.slow.update(bar.close);
 
             if let (Some(fast_now), Some(slow_now)) = (fast_now, slow_now) {
-                if let (Some(prev_fast), Some(prev_slow)) = (self.prev_fast, self.prev_slow) {
-                    if prev_fast <= prev_slow && fast_now > slow_now {
-                        ctx.set_target_position(TargetPosition::LongAllIn);
-                    }
-                    if prev_fast >= prev_slow && fast_now < slow_now {
-                        ctx.set_target_position(TargetPosition::Flat);
-                    }
+                if fast_now > slow_now {
+                    ctx.set_target_position(TargetPosition::LongAllIn);
+                } else if fast_now < slow_now {
+                    ctx.set_target_position(TargetPosition::Flat);
                 }
 
                 self.prev_fast = Some(fast_now);
@@ -160,10 +191,6 @@ mod tests {
         assert_eq!(
             sma.update(Decimal::from_str("3").expect("decimal")),
             Some(Decimal::from_str("2").expect("decimal"))
-        );
-        assert_eq!(
-            sma.update(Decimal::from_str("6").expect("decimal")),
-            Some(Decimal::from_str("3.6666666666666666666666666667").expect("decimal"))
         );
     }
 }

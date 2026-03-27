@@ -1,9 +1,9 @@
 [package]
 name = "quantforge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Deterministic CLI-first market data ingestion and backtesting framework in Rust."
+description = "Deterministic CLI-first market data ingestion, backtesting, and controlled live trading framework in Rust."
 license = "MIT"
 repository = "https://github.com/formaldehid/quantforge"
 homepage = "https://github.com/formaldehid/quantforge"
@@ -27,17 +27,21 @@ path = "src/main.rs"
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust_decimal = { version = "1", features = ["serde", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "1"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 assert_cmd = "2"
