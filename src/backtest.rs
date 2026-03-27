@@ -1,20 +1,10 @@
+use crate::{
+    Candle, ClosedTrade, MarketId, Strategy, StrategyContext, TargetPosition, TimestampMs,
+};
 use rust_decimal::Decimal;
-use thiserror::Error;
 use tracing::info;
 
-use crate::{
-    model::{Candle, MarketId, TimestampMs},
-    sdk::{Strategy, StrategyContext, StrategyError, TargetPosition},
-};
-
-#[derive(Error, Debug)]
-pub enum BacktestError {
-    #[error("no candles provided")]
-    NoCandles,
-
-    #[error("strategy error: {0}")]
-    Strategy(#[from] StrategyError),
-}
+use crate::EngineError;
 
 #[derive(Clone, Debug)]
 pub struct BacktestConfig {
@@ -34,23 +24,13 @@ impl Default for BacktestConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Trade {
-    pub entry_time_ms: TimestampMs,
-    pub entry_price: Decimal,
-    pub exit_time_ms: TimestampMs,
-    pub exit_price: Decimal,
-    pub qty: Decimal,
-    pub pnl: Decimal,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct BacktestResult {
     pub initial_cash: Decimal,
     pub final_equity: Decimal,
     pub total_return_pct: Decimal,
     pub trade_count: usize,
     pub max_drawdown_pct: Decimal,
-    pub trades: Vec<Trade>,
+    pub trades: Vec<ClosedTrade>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,9 +48,9 @@ impl BacktestEngine {
         market: &MarketId,
         candles: &[Candle],
         strategy: &mut dyn Strategy,
-    ) -> Result<BacktestResult, BacktestError> {
+    ) -> Result<BacktestResult, EngineError> {
         if candles.is_empty() {
-            return Err(BacktestError::NoCandles);
+            return Err(EngineError::NoCandles);
         }
 
         let fee_rate = self.cfg.fee_bps / Decimal::from(10_000);
@@ -87,7 +67,7 @@ impl BacktestEngine {
             now_ms: candles[0].open_time_ms,
             cash,
             position_qty: qty,
-            desired_next: None,
+            desired_target: None,
         };
 
         strategy.on_start(&mut ctx)?;
@@ -98,6 +78,7 @@ impl BacktestEngine {
             if index > 0 {
                 if let Some(target) = pending_target.take() {
                     execute_target(
+                        market,
                         target,
                         candle.open,
                         candle.open_time_ms,
@@ -112,7 +93,7 @@ impl BacktestEngine {
 
             ctx.cash = cash;
             ctx.position_qty = qty;
-            ctx.desired_next = None;
+            ctx.desired_target = None;
 
             let equity = cash + qty * candle.close;
             if equity > peak_equity {
@@ -126,21 +107,23 @@ impl BacktestEngine {
             }
 
             strategy.on_bar(&mut ctx, candle)?;
-            pending_target = ctx.desired_next;
+            pending_target = ctx.desired_target;
         }
 
         if self.cfg.close_out_at_end && qty > Decimal::ZERO {
-            let last = candles.last().expect("non-empty checked above");
-            execute_target(
-                TargetPosition::Flat,
-                last.close,
-                last.close_time_ms,
-                fee_rate,
-                &mut cash,
-                &mut qty,
-                &mut open_trade,
-                &mut trades,
-            );
+            if let Some(last) = candles.last() {
+                execute_target(
+                    market,
+                    TargetPosition::Flat,
+                    last.close,
+                    last.close_time_ms,
+                    fee_rate,
+                    &mut cash,
+                    &mut qty,
+                    &mut open_trade,
+                    &mut trades,
+                );
+            }
         }
 
         ctx.cash = cash;
@@ -184,6 +167,7 @@ struct OpenTrade {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_target(
+    market: &MarketId,
     target: TargetPosition,
     price: Decimal,
     timestamp_ms: TimestampMs,
@@ -191,7 +175,7 @@ fn execute_target(
     cash: &mut Decimal,
     qty: &mut Decimal,
     open_trade: &mut Option<OpenTrade>,
-    trades: &mut Vec<Trade>,
+    trades: &mut Vec<ClosedTrade>,
 ) {
     match target {
         TargetPosition::Flat => {
@@ -204,13 +188,16 @@ fn execute_target(
             let cash_after = *cash + notional - fee;
 
             if let Some(open_trade) = open_trade.take() {
-                trades.push(Trade {
+                trades.push(ClosedTrade {
+                    symbol: market.symbol.clone(),
                     entry_time_ms: open_trade.entry_time_ms,
-                    entry_price: open_trade.entry_price,
                     exit_time_ms: timestamp_ms,
+                    entry_price: open_trade.entry_price,
                     exit_price: price,
                     qty: open_trade.qty,
-                    pnl: cash_after - open_trade.cash_before,
+                    gross_quote_pnl: cash_after - open_trade.cash_before,
+                    entry_order_id: None,
+                    exit_order_id: None,
                 });
             }
 
@@ -250,7 +237,7 @@ struct EngineContext {
     now_ms: TimestampMs,
     cash: Decimal,
     position_qty: Decimal,
-    desired_next: Option<TargetPosition>,
+    desired_target: Option<TargetPosition>,
 }
 
 impl StrategyContext for EngineContext {
@@ -271,70 +258,87 @@ impl StrategyContext for EngineContext {
     }
 
     fn set_target_position(&mut self, target: TargetPosition) {
-        self.desired_next = Some(target);
+        self.desired_target = Some(target);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        model::{ExchangeId, Interval, Symbol},
-        sdk::strategies::SmaCrossStrategy,
-    };
+    use crate::{ExchangeId, Interval, Symbol};
     use std::str::FromStr;
 
-    fn candle(open_time_ms: i64, open: &str, close: &str) -> Candle {
-        let open = Decimal::from_str(open).expect("decimal");
-        let close = Decimal::from_str(close).expect("decimal");
-        let high = open.max(close) + Decimal::ONE;
-        let low = open.min(close) - Decimal::ONE;
+    #[derive(Debug)]
+    struct ScriptedStrategy {
+        targets: Vec<(TimestampMs, TargetPosition)>,
+    }
 
+    impl Strategy for ScriptedStrategy {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn on_bar(
+            &mut self,
+            ctx: &mut dyn StrategyContext,
+            bar: &Candle,
+        ) -> Result<(), crate::StrategyError> {
+            for (ts, target) in &self.targets {
+                if *ts == bar.open_time_ms {
+                    ctx.set_target_position(*target);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn market() -> MarketId {
+        MarketId::new(
+            ExchangeId::BinanceSpot,
+            Symbol::new("BTCUSDT").expect("symbol"),
+            Interval::M1,
+        )
+    }
+
+    fn candle(open_time_ms: i64, open: &str, close: &str) -> Candle {
         Candle {
             open_time_ms,
             close_time_ms: open_time_ms + 59_999,
-            open,
-            high,
-            low,
-            close,
-            volume: Decimal::from(100),
+            open: Decimal::from_str(open).expect("decimal"),
+            high: Decimal::from_str(close).expect("decimal"),
+            low: Decimal::from_str(open).expect("decimal"),
+            close: Decimal::from_str(close).expect("decimal"),
+            volume: Decimal::ONE,
             trades: Some(1),
         }
     }
 
     #[test]
-    fn backtest_is_deterministic() {
-        let market = MarketId::new(
-            ExchangeId::BinanceSpot,
-            Symbol::new("BTCUSDT").expect("symbol"),
-            Interval::M1,
-        );
+    fn backtest_executes_on_next_bar_open_and_records_trade() {
         let candles = vec![
             candle(0, "100", "100"),
-            candle(60_000, "100", "101"),
-            candle(120_000, "101", "102"),
-            candle(180_000, "102", "105"),
-            candle(240_000, "105", "103"),
-            candle(300_000, "103", "99"),
-            candle(360_000, "99", "98"),
-            candle(420_000, "98", "101"),
+            candle(60_000, "110", "110"),
+            candle(120_000, "120", "120"),
         ];
+        let mut strategy = ScriptedStrategy {
+            targets: vec![
+                (0, TargetPosition::LongAllIn),
+                (60_000, TargetPosition::Flat),
+            ],
+        };
 
-        let mut strategy = SmaCrossStrategy::new(2, 3).expect("strategy");
-        let engine = BacktestEngine::new(BacktestConfig {
-            initial_cash: Decimal::from(10_000),
-            fee_bps: Decimal::from(10),
+        let result = BacktestEngine::new(BacktestConfig {
+            initial_cash: Decimal::from(1_000),
+            fee_bps: Decimal::ZERO,
             close_out_at_end: true,
-        });
+        })
+        .run(&market(), &candles, &mut strategy)
+        .expect("backtest");
 
-        let result_a = engine
-            .run(&market, &candles, &mut strategy)
-            .expect("backtest");
-        let mut strategy_b = SmaCrossStrategy::new(2, 3).expect("strategy");
-        let result_b = engine
-            .run(&market, &candles, &mut strategy_b)
-            .expect("backtest");
-
-        assert_eq!(result_a, result_b);
+        assert_eq!(result.trade_count, 1);
+        assert_eq!(result.trades[0].entry_price, Decimal::from(110));
+        assert_eq!(result.trades[0].exit_price, Decimal::from(120));
+        assert!(result.final_equity > Decimal::from(1_000));
+        assert!(result.trades[0].gross_quote_pnl > Decimal::ZERO);
     }
 }
