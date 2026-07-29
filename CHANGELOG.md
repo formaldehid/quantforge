@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- ci runs on pull requests targeting `main` instead of on every push and pull request, removing duplicate workflow runs
+- superseded ci runs for the same pull request are cancelled automatically
+
 ### Fixed
 
 - `Interval::H8` now formats as `8h` instead of `1m`
