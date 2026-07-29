@@ -88,7 +88,7 @@ impl Interval {
             Self::H2 => "2h",
             Self::H4 => "4h",
             Self::H6 => "6h",
-            Self::H8 => "1m",
+            Self::H8 => "8h",
             Self::H12 => "12h",
             Self::D1 => "1d",
             Self::D3 => "3d",
@@ -695,6 +695,114 @@ mod tests {
         assert_eq!(
             order.average_price(),
             Some(Decimal::from_str("10000").expect("decimal"))
+        );
+    }
+
+    /// Every `Interval` variant with the exact wire string Binance expects.
+    const INTERVAL_CASES: [(Interval, &str); 15] = [
+        (Interval::S1, "1s"),
+        (Interval::M1, "1m"),
+        (Interval::M3, "3m"),
+        (Interval::M5, "5m"),
+        (Interval::M15, "15m"),
+        (Interval::M30, "30m"),
+        (Interval::H1, "1h"),
+        (Interval::H2, "2h"),
+        (Interval::H4, "4h"),
+        (Interval::H6, "6h"),
+        (Interval::H8, "8h"),
+        (Interval::H12, "12h"),
+        (Interval::D1, "1d"),
+        (Interval::D3, "3d"),
+        (Interval::W1, "1w"),
+    ];
+
+    #[test]
+    fn interval_cases_cover_every_variant() {
+        let variants: HashSet<Interval> = INTERVAL_CASES
+            .into_iter()
+            .map(|(interval, _)| interval)
+            .collect();
+        assert_eq!(variants.len(), 15);
+
+        for interval in variants {
+            // Exhaustive on purpose: a new variant stops this module from
+            // compiling until it is added to INTERVAL_CASES.
+            match interval {
+                Interval::S1
+                | Interval::M1
+                | Interval::M3
+                | Interval::M5
+                | Interval::M15
+                | Interval::M30
+                | Interval::H1
+                | Interval::H2
+                | Interval::H4
+                | Interval::H6
+                | Interval::H8
+                | Interval::H12
+                | Interval::D1
+                | Interval::D3
+                | Interval::W1 => {}
+            }
+        }
+    }
+
+    #[test]
+    fn interval_as_str_matches_exchange_wire_format() {
+        for (interval, expected) in INTERVAL_CASES {
+            assert_eq!(interval.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn interval_display_matches_as_str() {
+        for (interval, expected) in INTERVAL_CASES {
+            assert_eq!(interval.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn interval_wire_format_round_trips_through_parsing() {
+        for (interval, expected) in INTERVAL_CASES {
+            assert_eq!(expected.parse::<Interval>().expect("interval"), interval);
+            assert_eq!(
+                interval.as_str().parse::<Interval>().expect("interval"),
+                interval
+            );
+        }
+    }
+
+    #[test]
+    fn interval_wire_formats_are_unique_per_variant() {
+        let formatted: HashSet<&'static str> = INTERVAL_CASES
+            .into_iter()
+            .map(|(interval, _)| interval.as_str())
+            .collect();
+        assert_eq!(formatted.len(), 15);
+    }
+
+    // Regression: QF-001, Interval::H8 formatted as "1m".
+    #[test]
+    fn h8_formats_as_eight_hours_and_not_one_minute() {
+        assert_eq!(Interval::H8.as_str(), "8h");
+        assert_eq!(Interval::H8.to_string(), "8h");
+        assert_eq!("8h".parse::<Interval>().expect("interval"), Interval::H8);
+    }
+
+    #[test]
+    fn unknown_interval_string_is_rejected() {
+        let error = "7m".parse::<Interval>().expect_err("interval error");
+        assert!(matches!(error, ModelError::InvalidInterval(_)));
+        assert_eq!(error.to_string(), "invalid interval: 7m");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_when_parsing() {
+        assert_eq!(" 8h ".parse::<Interval>().expect("interval"), Interval::H8);
+        assert_eq!(
+            "\t1d\n".parse::<Interval>().expect("interval"),
+            Interval::D1
         );
     }
 }

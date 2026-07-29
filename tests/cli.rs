@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use tempfile::tempdir;
 
 #[test]
 fn help_lists_v020_command_groups() {
@@ -11,4 +12,28 @@ fn help_lists_v020_command_groups() {
         .stdout(predicate::str::contains("backtest"))
         .stdout(predicate::str::contains("trade"))
         .stdout(predicate::str::contains("monitor"));
+}
+
+#[test]
+fn data_validate_reports_the_requested_interval() {
+    let tempdir = tempdir().expect("tempdir");
+    let db_path = tempdir.path().join("market.sqlite");
+
+    let mut cmd = Command::cargo_bin("quantforge").expect("binary");
+    cmd.arg("--db")
+        .arg(&db_path)
+        .arg("--log-level")
+        .arg("error")
+        .args([
+            "data",
+            "validate",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "8h",
+        ]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("market: binance_spot BTCUSDT 8h"))
+        .stdout(predicate::str::contains("candles: 0"));
 }
