@@ -73,6 +73,12 @@ cargo run -- \
   --interval 1m
 ```
 
+Boundary semantics: omitting `--start` begins at the current time (no
+historical backfill — pass `--start` to backfill), and omitting `--end` keeps
+the sync running until interrupted. A bounded sync reports the covered range
+in its summary and warns when the exchange returned no candles for part of
+the requested window.
+
 Validate the stored series:
 
 ```bash

@@ -71,6 +71,18 @@ impl<'a> LiveTradeEngine<'a> {
             .market_data
             .fetch_symbol_rules(&cfg.market.symbol)
             .await?;
+        if rules.effective_market_step_size().is_none() {
+            warn!(
+                symbol = %cfg.market.symbol,
+                "exchange reported no lot-size step; quantity rounding is disabled"
+            );
+        }
+        if rules.min_notional.is_none() {
+            warn!(
+                symbol = %cfg.market.symbol,
+                "exchange reported no min-notional rule; the notional pre-trade check is disabled"
+            );
+        }
         let mut strategy = cfg.strategy.build()?;
 
         let result = self
@@ -101,6 +113,7 @@ impl<'a> LiveTradeEngine<'a> {
     fn load_or_create_run_state(&self, cfg: &LiveTradeConfig) -> Result<BotRunState, EngineError> {
         if let Some(run_id) = &cfg.run_id {
             if let Some(existing) = self.journal_store.load_run_state(run_id)? {
+                apply_resume_checks(&existing, cfg)?;
                 return Ok(existing);
             }
         }
@@ -116,6 +129,7 @@ impl<'a> LiveTradeEngine<'a> {
             strategy_config: serde_json::to_value(&cfg.strategy).map_err(|err| {
                 EngineError::InvalidConfig(format!("failed to serialize strategy config: {err}"))
             })?,
+            execution_mode: cfg.execution_mode,
             status: RunStatus::Starting,
             last_processed_open_time_ms: None,
             started_at_ms: now_ms,
@@ -137,10 +151,30 @@ impl<'a> LiveTradeEngine<'a> {
         self.journal_store.save_run_state(run_state)?;
 
         let now = now_utc_ms();
-        let bootstrap_start = run_state
-            .last_processed_open_time_ms
-            .map(|value| value + cfg.market.interval.step_ms())
-            .or_else(|| Some(now - (cfg.market.interval.step_ms() * cfg.bootstrap_bars as i64)));
+        let bootstrap_start = match run_state.last_processed_open_time_ms {
+            Some(value) => Some(value + cfg.market.interval.step_ms()),
+            None => {
+                let bars = i64::try_from(cfg.bootstrap_bars).map_err(|_| {
+                    EngineError::InvalidConfig(format!(
+                        "bootstrap_bars {} does not fit into the timestamp range",
+                        cfg.bootstrap_bars
+                    ))
+                })?;
+                let window_start = cfg
+                    .market
+                    .interval
+                    .step_ms()
+                    .checked_mul(bars)
+                    .and_then(|window_ms| now.checked_sub(window_ms))
+                    .ok_or_else(|| {
+                        EngineError::InvalidConfig(format!(
+                            "bootstrap window overflows: {} bars of {}",
+                            cfg.bootstrap_bars, cfg.market.interval
+                        ))
+                    })?;
+                Some(window_start)
+            }
+        };
 
         if let Some(start_ms) = bootstrap_start {
             sync_market_range(
@@ -279,6 +313,14 @@ impl<'a> LiveTradeEngine<'a> {
         reference_bar: &Candle,
         summary: &mut LiveTradeSummary,
     ) -> Result<(), EngineError> {
+        // The min-notional entry check runs for BOTH execution modes, so a
+        // clean dry run implies the same notional validation a live entry
+        // performs. Exit-side quantity checks (balance, min/max lot rules)
+        // depend on live balances and still run only in live mode.
+        if target == TargetPosition::LongAllIn {
+            ensure_entry_notional(rules, cfg.quote_order_qty)?;
+        }
+
         let order = match cfg.execution_mode {
             ExecutionMode::DryRun => synthetic_market_order(
                 rules,
@@ -293,15 +335,6 @@ impl<'a> LiveTradeEngine<'a> {
                 })?;
                 match target {
                     TargetPosition::LongAllIn => {
-                        if let Some(min_notional) = rules.min_notional {
-                            if cfg.quote_order_qty < min_notional {
-                                return Err(EngineError::InvalidConfig(format!(
-                                    "quote_order_qty {} is below exchange min_notional {}",
-                                    cfg.quote_order_qty, min_notional
-                                )));
-                            }
-                        }
-
                         venue
                             .submit_market_order(&MarketOrderRequest {
                                 symbol: cfg.market.symbol.clone(),
@@ -334,6 +367,20 @@ impl<'a> LiveTradeEngine<'a> {
                             );
                             return Ok(());
                         }
+                        if let Some(min_qty) = sell_qty_below_market_min(requested_qty, rules) {
+                            warn!(
+                                requested_qty = %requested_qty,
+                                min_qty = %min_qty,
+                                "ignoring flat target: quantity is below the exchange minimum \
+                                 (dust); the exchange would reject the sell"
+                            );
+                            return Ok(());
+                        }
+                        if let Some(max_qty) = sell_qty_above_market_max(requested_qty, rules) {
+                            return Err(EngineError::InvalidState(format!(
+                                "sell quantity {requested_qty} exceeds exchange maximum {max_qty}"
+                            )));
+                        }
 
                         venue
                             .submit_market_order(&MarketOrderRequest {
@@ -356,21 +403,68 @@ impl<'a> LiveTradeEngine<'a> {
             run_id = %run_state.run_id,
             side = %order.side,
             status = %order.status.as_str(),
-            executed_qty = %order.executed_qty,
+            executed_qty = ?order.executed_qty,
             avg_price = ?order.average_price(),
             "order submitted"
         );
 
-        self.journal_store
-            .append_order_event(&run_state.run_id, &order)?;
+        // Journal the order event, but defer any journaling failure until the
+        // position mutation below is persisted: an executed order must be
+        // reflected in local state even when the journal write fails,
+        // otherwise a restart sees a flat position and doubles the exposure.
+        let order_event_result = self
+            .journal_store
+            .append_order_event(&run_state.run_id, &order)
+            .map_err(|err| {
+                EngineError::InvalidState(format!(
+                    "order executed but journaling the order event failed ({err}); \
+                     reconcile manually with `monitor status`"
+                ))
+            });
         summary.submitted_orders += 1;
 
         match target {
             TargetPosition::LongAllIn => {
-                let qty = order.net_base_qty_after_base_fees(&rules.base_asset);
-                if qty <= Decimal::ZERO {
+                let executed_qty = order.executed_qty.ok_or_else(|| {
+                    EngineError::InvalidState(format!(
+                        "exchange did not report an executed quantity for entry order {:?}; \
+                         reconcile the position manually with `monitor status`",
+                        order.order_id
+                    ))
+                })?;
+                if executed_qty <= Decimal::ZERO {
                     warn!("entry order had zero executed quantity");
+                    order_event_result?;
                     return Ok(());
+                }
+
+                // The buy has executed: the position must be recorded even
+                // when parts of the response are missing. Missing fills mean
+                // the gross quantity is recorded (no fee deduction can be
+                // computed); a missing price is recorded as None and will
+                // fail the exit explicitly instead of fabricating PnL.
+                let qty = match order.net_base_qty_after_base_fees(&rules.base_asset) {
+                    Some(net) => net,
+                    None => {
+                        warn!(
+                            order_id = ?order.order_id,
+                            "exchange did not report fills; recording gross executed \
+                             quantity without fee deduction"
+                        );
+                        executed_qty
+                    }
+                };
+                if qty <= Decimal::ZERO {
+                    warn!("entry order netted zero quantity after fees");
+                    order_event_result?;
+                    return Ok(());
+                }
+                if order.average_price().is_none() {
+                    warn!(
+                        order_id = ?order.order_id,
+                        "exchange did not report a fill price for the entry; closing \
+                         this position will not produce a trade record"
+                    );
                 }
 
                 run_state.position = PositionState {
@@ -379,24 +473,73 @@ impl<'a> LiveTradeEngine<'a> {
                     entry_time_ms: order.transact_time_ms.or(Some(reference_bar.close_time_ms)),
                     entry_order_id: order.order_id,
                 };
+
+                run_state.updated_at_ms = now_utc_ms();
+                run_state.status = RunStatus::Running;
+                run_state.last_error = None;
+                self.journal_store.save_run_state(run_state)?;
+                order_event_result?;
+                Ok(())
             }
             TargetPosition::Flat => {
-                let closed_qty = order.executed_qty.min(run_state.position.qty);
+                let executed_qty = order.executed_qty.ok_or_else(|| {
+                    EngineError::InvalidState(format!(
+                        "exchange did not report an executed quantity for exit order {:?}; \
+                         run state left unchanged — reconcile manually with `monitor status`",
+                        order.order_id
+                    ))
+                })?;
+                let closed_qty = executed_qty.min(run_state.position.qty);
                 if closed_qty <= Decimal::ZERO {
                     warn!("exit order had zero executed quantity");
+                    order_event_result?;
                     return Ok(());
                 }
 
-                let entry_price = run_state
-                    .position
-                    .entry_price
-                    .unwrap_or(reference_bar.close);
-                let exit_price = order.average_price().unwrap_or(reference_bar.close);
+                // The sell has executed on the exchange, so the local
+                // position is updated and persisted before anything below
+                // can fail. A missing price then aborts with a clear error
+                // instead of writing a closed-trade row with fabricated PnL.
+                let position_before = run_state.position.clone();
+                let remaining_qty = (position_before.qty - closed_qty).max(Decimal::ZERO);
+                if remaining_qty > Decimal::ZERO && !is_dust_remnant(remaining_qty, rules) {
+                    run_state.position.qty = remaining_qty;
+                } else {
+                    if remaining_qty > Decimal::ZERO {
+                        warn!(
+                            written_off_qty = %remaining_qty,
+                            "position remnant after exit is below the tradeable minimum; \
+                             writing it off so the run does not wedge on unsellable dust"
+                        );
+                    }
+                    run_state.position = PositionState::flat();
+                }
+                run_state.updated_at_ms = now_utc_ms();
+                run_state.status = RunStatus::Running;
+                run_state.last_error = None;
+                self.journal_store.save_run_state(run_state)?;
+                order_event_result?;
+
+                let entry_price = position_before.entry_price.ok_or_else(|| {
+                    EngineError::InvalidState(
+                        "position had no recorded entry price; the exit was executed and \
+                         position state updated, but no closed-trade row was written \
+                         because its PnL would be fabricated"
+                            .to_string(),
+                    )
+                })?;
+                let exit_price = order.average_price().ok_or_else(|| {
+                    EngineError::InvalidState(format!(
+                        "exchange did not report a fill price for exit order {:?}; the exit \
+                         was executed and position state updated, but no closed-trade row \
+                         was written because its PnL would be fabricated",
+                        order.order_id
+                    ))
+                })?;
 
                 let closed_trade = ClosedTrade {
                     symbol: cfg.market.symbol.clone(),
-                    entry_time_ms: run_state
-                        .position
+                    entry_time_ms: position_before
                         .entry_time_ms
                         .unwrap_or(reference_bar.open_time_ms),
                     exit_time_ms: order
@@ -406,28 +549,71 @@ impl<'a> LiveTradeEngine<'a> {
                     exit_price,
                     qty: closed_qty,
                     gross_quote_pnl: (exit_price - entry_price) * closed_qty,
-                    entry_order_id: run_state.position.entry_order_id,
+                    entry_order_id: position_before.entry_order_id,
                     exit_order_id: order.order_id,
                 };
                 self.journal_store
                     .append_closed_trade(&run_state.run_id, &closed_trade)?;
                 summary.closed_trades += 1;
-
-                let remaining_qty = (run_state.position.qty - closed_qty).max(Decimal::ZERO);
-                if remaining_qty > Decimal::ZERO {
-                    run_state.position.qty = remaining_qty;
-                } else {
-                    run_state.position = PositionState::flat();
-                }
+                Ok(())
             }
         }
-
-        run_state.updated_at_ms = now_utc_ms();
-        run_state.status = RunStatus::Running;
-        run_state.last_error = None;
-        self.journal_store.save_run_state(run_state)?;
-        Ok(())
     }
+}
+
+/// Validates that a resumed run matches the current invocation's identity.
+///
+/// A run's market, strategy, and execution mode are part of its identity: a
+/// position accumulated under one must never be silently adopted by another
+/// (a dry-run position leaking into live trading being the worst case).
+fn apply_resume_checks(existing: &BotRunState, cfg: &LiveTradeConfig) -> Result<(), EngineError> {
+    if existing.market != cfg.market {
+        return Err(EngineError::InvalidConfig(format!(
+            "run {} was recorded for market {} {} {}, but this invocation targets {} {} {}; \
+             refusing to resume",
+            existing.run_id,
+            existing.market.exchange,
+            existing.market.symbol,
+            existing.market.interval,
+            cfg.market.exchange,
+            cfg.market.symbol,
+            cfg.market.interval
+        )));
+    }
+
+    let strategy_name = cfg.strategy.strategy_name();
+    if existing.strategy_name != strategy_name {
+        return Err(EngineError::InvalidConfig(format!(
+            "run {} was recorded with strategy {}, but this invocation uses {}; \
+             refusing to resume",
+            existing.run_id, existing.strategy_name, strategy_name
+        )));
+    }
+
+    let strategy_config = serde_json::to_value(&cfg.strategy).map_err(|err| {
+        EngineError::InvalidConfig(format!("failed to serialize strategy config: {err}"))
+    })?;
+    if existing.strategy_config != strategy_config {
+        return Err(EngineError::InvalidConfig(format!(
+            "run {} was recorded with strategy config {}, but this invocation uses {}; \
+             refusing to resume so its position is not driven by different parameters",
+            existing.run_id, existing.strategy_config, strategy_config
+        )));
+    }
+
+    if existing.execution_mode != cfg.execution_mode {
+        return Err(EngineError::InvalidConfig(format!(
+            "run {} was recorded in {} mode, but this invocation is {} mode; refusing to \
+             resume so a {} position cannot leak into {} trading",
+            existing.run_id,
+            existing.execution_mode.as_str(),
+            cfg.execution_mode.as_str(),
+            existing.execution_mode.as_str(),
+            cfg.execution_mode.as_str()
+        )));
+    }
+
+    Ok(())
 }
 
 fn current_target(position: &PositionState) -> TargetPosition {
@@ -452,6 +638,43 @@ fn maybe_round_qty(qty: Decimal, rules: &SymbolRules) -> Decimal {
     } else {
         qty
     }
+}
+
+fn ensure_entry_notional(rules: &SymbolRules, quote_order_qty: Decimal) -> Result<(), EngineError> {
+    if let Some(min_notional) = rules.min_notional {
+        if quote_order_qty < min_notional {
+            return Err(EngineError::InvalidConfig(format!(
+                "quote_order_qty {quote_order_qty} is below exchange min_notional {min_notional}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Returns the exchange market-order minimum when `qty` is below it.
+fn sell_qty_below_market_min(qty: Decimal, rules: &SymbolRules) -> Option<Decimal> {
+    rules
+        .effective_market_min_qty()
+        .filter(|min_qty| qty < *min_qty)
+}
+
+/// Returns the exchange market-order maximum when `qty` exceeds it.
+fn sell_qty_above_market_max(qty: Decimal, rules: &SymbolRules) -> Option<Decimal> {
+    rules
+        .effective_market_max_qty()
+        .filter(|max_qty| qty > *max_qty)
+}
+
+/// A position remnant is dust when it cannot be sold: it rounds to zero at
+/// the exchange step size or falls below the market minimum quantity.
+/// Keeping dust as an open position wedges the run — exits skip it as
+/// unsellable while entries are no-ops because the position reads as open.
+fn is_dust_remnant(qty: Decimal, rules: &SymbolRules) -> bool {
+    if qty <= Decimal::ZERO {
+        return false;
+    }
+    let tradeable = maybe_round_qty(qty, rules);
+    tradeable <= Decimal::ZERO || sell_qty_below_market_min(tradeable, rules).is_some()
 }
 
 fn synthetic_market_order(
@@ -492,11 +715,13 @@ fn synthetic_market_order(
         client_order_id: Some(new_client_order_id("dry", &run_state.run_id)),
         requested_qty,
         requested_quote_qty,
-        executed_qty,
-        cumulative_quote_qty,
+        executed_qty: Some(executed_qty),
+        cumulative_quote_qty: Some(cumulative_quote_qty),
         avg_price: Some(reference_bar.close),
         transact_time_ms: Some(reference_bar.close_time_ms),
-        fills: Vec::new(),
+        // Synthetic fills model no fees: dry-run reports the gross quantity
+        // as net, which is optimistic relative to a real fill.
+        fills: Some(Vec::new()),
         raw: serde_json::json!({
             "execution_mode": "dry_run",
             "reference_open_time_ms": reference_bar.open_time_ms,
@@ -549,6 +774,10 @@ impl LiveStrategyContext {
         Self {
             market,
             now_ms: now_utc_ms(),
+            // Live trading does not track quote-asset cash: `ctx.cash()` is
+            // always zero here, while the backtest context reports real cash.
+            // Cash-based position sizing is a backtest-only feature today;
+            // live sizing comes from `LiveTradeConfig::quote_order_qty`.
             cash: Decimal::ZERO,
             position_qty,
             desired_target: None,
@@ -627,6 +856,7 @@ mod tests {
             market: market(),
             strategy_name: "sma_cross".to_string(),
             strategy_config: serde_json::json!({"kind":"sma_cross","fast":20,"slow":50}),
+            execution_mode: ExecutionMode::DryRun,
             status: RunStatus::Running,
             last_processed_open_time_ms: None,
             started_at_ms: 0,
@@ -657,7 +887,7 @@ mod tests {
         assert_eq!(order.requested_quote_qty, Some(Decimal::from(123)));
         assert_eq!(
             order.executed_qty,
-            Decimal::from_str("0.012").expect("decimal")
+            Some(Decimal::from_str("0.012").expect("decimal"))
         );
     }
 
@@ -679,7 +909,147 @@ mod tests {
         );
         assert_eq!(
             order.executed_qty,
-            Decimal::from_str("0.025").expect("decimal")
+            Some(Decimal::from_str("0.025").expect("decimal"))
+        );
+    }
+
+    fn config(execution_mode: ExecutionMode) -> LiveTradeConfig {
+        LiveTradeConfig {
+            market: market(),
+            strategy: BuiltInStrategyConfig::SmaCross { fast: 20, slow: 50 },
+            execution_mode,
+            quote_order_qty: Decimal::from(100),
+            poll_interval: Duration::from_secs(1),
+            bootstrap_bars: 10,
+            bootstrap_enter: false,
+            batch_limit: 1000,
+            run_id: Some("run-1".to_string()),
+            max_loops: Some(1),
+        }
+    }
+
+    #[test]
+    fn resume_refuses_execution_mode_mismatch() {
+        let existing = run_state();
+        let error = apply_resume_checks(&existing, &config(ExecutionMode::Live)).expect_err("mode");
+        assert!(matches!(error, EngineError::InvalidConfig(_)));
+        assert!(
+            error.to_string().contains("recorded in dry_run mode"),
+            "got {error}"
+        );
+        assert!(
+            error.to_string().contains("cannot leak into live trading"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_market_mismatch() {
+        let mut existing = run_state();
+        existing.market = MarketId::new(
+            ExchangeId::BinanceSpot,
+            Symbol::new("ETHUSDT").expect("symbol"),
+            Interval::M1,
+        );
+        let error =
+            apply_resume_checks(&existing, &config(ExecutionMode::DryRun)).expect_err("market");
+        assert!(matches!(error, EngineError::InvalidConfig(_)));
+        assert!(error.to_string().contains("ETHUSDT"), "got {error}");
+        assert!(
+            error.to_string().contains("refusing to resume"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_strategy_mismatch() {
+        let mut existing = run_state();
+        existing.strategy_name = "other_strategy".to_string();
+        let error =
+            apply_resume_checks(&existing, &config(ExecutionMode::DryRun)).expect_err("strategy");
+        assert!(matches!(error, EngineError::InvalidConfig(_)));
+        assert!(error.to_string().contains("other_strategy"), "got {error}");
+    }
+
+    #[test]
+    fn resume_refuses_strategy_parameter_mismatch() {
+        let mut existing = run_state();
+        existing.strategy_config = serde_json::json!({"kind":"sma_cross","fast":5,"slow":200});
+        let error = apply_resume_checks(&existing, &config(ExecutionMode::DryRun))
+            .expect_err("parameter mismatch");
+        assert!(matches!(error, EngineError::InvalidConfig(_)));
+        assert!(error.to_string().contains("strategy config"), "got {error}");
+    }
+
+    #[test]
+    fn resume_accepts_matching_identity() {
+        let existing = run_state();
+        apply_resume_checks(&existing, &config(ExecutionMode::DryRun)).expect("matching");
+    }
+
+    #[test]
+    fn dust_remnants_are_detected_only_below_the_tradeable_minimum() {
+        // step 0.001, market min 0.001 (from rules()).
+        let sub_step = Decimal::from_str("0.0004").expect("decimal");
+        let at_min = Decimal::from_str("0.001").expect("decimal");
+        let sellable = Decimal::from_str("0.5").expect("decimal");
+
+        assert!(is_dust_remnant(sub_step, &rules()));
+        assert!(!is_dust_remnant(at_min, &rules()));
+        assert!(!is_dust_remnant(sellable, &rules()));
+        assert!(!is_dust_remnant(Decimal::ZERO, &rules()));
+    }
+
+    #[test]
+    fn entry_notional_below_exchange_minimum_is_rejected() {
+        let error = ensure_entry_notional(&rules(), Decimal::from(9)).expect_err("notional error");
+        assert!(matches!(error, EngineError::InvalidConfig(_)));
+        assert!(
+            error.to_string().contains("below exchange min_notional 10"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn entry_notional_at_or_above_exchange_minimum_is_accepted() {
+        ensure_entry_notional(&rules(), Decimal::from(10)).expect("at minimum");
+        ensure_entry_notional(&rules(), Decimal::from(100)).expect("above minimum");
+    }
+
+    #[test]
+    fn sell_qty_rule_helpers_flag_only_out_of_range_quantities() {
+        let mut rules = rules();
+        rules.market_max_qty = Some(Decimal::from(1));
+
+        let below = Decimal::from_str("0.0001").expect("decimal");
+        let within = Decimal::from_str("0.5").expect("decimal");
+        let above = Decimal::from(2);
+
+        assert_eq!(
+            sell_qty_below_market_min(below, &rules),
+            Some(Decimal::from_str("0.001").expect("decimal"))
+        );
+        assert_eq!(sell_qty_below_market_min(within, &rules), None);
+        assert_eq!(
+            sell_qty_above_market_max(above, &rules),
+            Some(Decimal::from(1))
+        );
+        assert_eq!(sell_qty_above_market_max(within, &rules), None);
+    }
+
+    #[test]
+    fn sell_qty_rule_helpers_pass_everything_when_rules_are_absent() {
+        let mut rules = rules();
+        rules.min_qty = None;
+        rules.max_qty = None;
+        rules.market_min_qty = None;
+        rules.market_max_qty = None;
+
+        let qty = Decimal::from_str("0.0000001").expect("decimal");
+        assert_eq!(sell_qty_below_market_min(qty, &rules), None);
+        assert_eq!(
+            sell_qty_above_market_max(Decimal::from(1_000_000), &rules),
+            None
         );
     }
 }

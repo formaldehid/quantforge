@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::env;
+use tracing::warn;
 use url::{Url, form_urlencoded};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -452,10 +453,14 @@ fn parse_symbol_rules(info: BinanceSymbolInfo) -> Result<SymbolRules, ExchangeEr
     };
 
     for filter in info.filters {
-        let filter_type = filter
-            .get("filterType")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let Some(filter_type) = filter.get("filterType").and_then(Value::as_str) else {
+            warn!(
+                symbol = %rules.symbol,
+                filter = %filter,
+                "ignoring malformed exchange filter without a filterType"
+            );
+            continue;
+        };
 
         match filter_type {
             "LOT_SIZE" => {
@@ -506,17 +511,21 @@ fn parse_order(raw: Value) -> Result<ExchangeOrder, ExchangeError> {
     let side = response.side.parse::<Side>()?;
     let fills = response
         .fills
-        .into_iter()
-        .map(|fill| {
-            Ok(Fill {
-                price: parse_decimal(&fill.price, "fill.price")?,
-                qty: parse_decimal(&fill.qty, "fill.qty")?,
-                commission: parse_decimal(&fill.commission, "fill.commission")?,
-                commission_asset: fill.commission_asset,
-                trade_id: fill.trade_id,
-            })
+        .map(|fills| {
+            fills
+                .into_iter()
+                .map(|fill| {
+                    Ok(Fill {
+                        price: parse_decimal(&fill.price, "fill.price")?,
+                        qty: parse_decimal(&fill.qty, "fill.qty")?,
+                        commission: parse_decimal(&fill.commission, "fill.commission")?,
+                        commission_asset: fill.commission_asset,
+                        trade_id: fill.trade_id,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExchangeError>>()
         })
-        .collect::<Result<Vec<_>, ExchangeError>>()?;
+        .transpose()?;
 
     let requested_qty = match response.orig_qty {
         Some(value) => Some(parse_decimal(&value, "origQty")?),
@@ -534,12 +543,21 @@ fn parse_order(raw: Value) -> Result<ExchangeOrder, ExchangeError> {
         None => None,
     };
 
-    let executed_qty = parse_decimal(&response.executed_qty, "executedQty")?;
-    let cumulative_quote_qty = parse_decimal(&response.cumulative_quote_qty, "cumulativeQuoteQty")?;
-    let avg_price = if executed_qty > Decimal::ZERO {
-        Some(cumulative_quote_qty / executed_qty)
-    } else {
-        None
+    let executed_qty = response
+        .executed_qty
+        .as_deref()
+        .map(|value| parse_decimal(value, "executedQty"))
+        .transpose()?;
+    let cumulative_quote_qty = response
+        .cumulative_quote_qty
+        .as_deref()
+        .map(|value| parse_decimal(value, "cumulativeQuoteQty"))
+        .transpose()?;
+    let avg_price = match (executed_qty, cumulative_quote_qty) {
+        (Some(executed), Some(cumulative)) if executed > Decimal::ZERO => {
+            Some(cumulative / executed)
+        }
+        _ => None,
     };
 
     Ok(ExchangeOrder {
@@ -629,10 +647,6 @@ struct BinanceFill {
     trade_id: Option<i64>,
 }
 
-fn default_zero_string() -> String {
-    "0".to_string()
-}
-
 #[derive(Debug, Deserialize)]
 struct BinanceOrderResponse {
     symbol: String,
@@ -648,18 +662,15 @@ struct BinanceOrderResponse {
     orig_qty: Option<String>,
     #[serde(rename = "origQuoteOrderQty")]
     orig_quote_order_qty: Option<String>,
-    #[serde(rename = "executedQty", default = "default_zero_string")]
-    executed_qty: String,
-    #[serde(
-        rename = "cummulativeQuoteQty",
-        alias = "cumulativeQuoteQty",
-        default = "default_zero_string"
-    )]
-    cumulative_quote_qty: String,
+    // Absent fields stay `None`: an ACK-style response that omits fill data
+    // must remain distinguishable from a response reporting a zero fill.
+    #[serde(rename = "executedQty")]
+    executed_qty: Option<String>,
+    #[serde(rename = "cummulativeQuoteQty", alias = "cumulativeQuoteQty")]
+    cumulative_quote_qty: Option<String>,
     #[serde(rename = "transactTime")]
     transact_time: Option<i64>,
-    #[serde(default)]
-    fills: Vec<BinanceFill>,
+    fills: Option<Vec<BinanceFill>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -713,5 +724,122 @@ mod tests {
         assert_eq!(order.side, Side::Buy);
         assert_eq!(order.status, OrderStatus::Filled);
         assert_eq!(order.order_id, Some(7));
+        assert_eq!(
+            order.executed_qty,
+            Some(Decimal::from_str_exact("0.01000000").expect("decimal"))
+        );
+        assert_eq!(order.fills, Some(Vec::new()));
+    }
+
+    // A FULL response reports executed quantity, quote quantity, and fills;
+    // everything downstream may rely on Some values here.
+    #[test]
+    fn parse_order_full_response_reports_fills_and_quantities() {
+        let raw = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "orderId": 7,
+            "clientOrderId": "abc",
+            "side": "BUY",
+            "type": "MARKET",
+            "status": "FILLED",
+            "origQty": "0.01000000",
+            "executedQty": "0.01000000",
+            "cummulativeQuoteQty": "100.00000000",
+            "transactTime": 1,
+            "fills": [
+                {"price": "10000.0", "qty": "0.01", "commission": "0.00001", "commissionAsset": "BTC", "tradeId": 42}
+            ]
+        });
+
+        let order = parse_order(raw).expect("order");
+        let fills = order.fills.as_ref().expect("fills reported");
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].commission_asset.as_deref(), Some("BTC"));
+        assert_eq!(
+            order.net_base_qty_after_base_fees("BTC"),
+            Some(Decimal::from_str_exact("0.00999").expect("decimal"))
+        );
+        assert_eq!(
+            order.average_price(),
+            Some(Decimal::from_str_exact("10000").expect("decimal"))
+        );
+    }
+
+    // An ACK response carries no fill data at all: quantities and fills must
+    // surface as None (not zero) so callers cannot mistake it for a zero fill.
+    #[test]
+    fn parse_order_ack_response_reports_missing_fields_as_none() {
+        let raw = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "orderId": 7,
+            "clientOrderId": "abc",
+            "side": "BUY",
+            "type": "MARKET",
+            "transactTime": 1
+        });
+
+        let order = parse_order(raw).expect("order");
+        assert_eq!(order.executed_qty, None);
+        assert_eq!(order.cumulative_quote_qty, None);
+        assert_eq!(order.fills, None);
+        assert_eq!(order.average_price(), None);
+        assert_eq!(order.net_base_qty_after_base_fees("BTC"), None);
+        assert_eq!(order.status, OrderStatus::Unknown);
+    }
+
+    #[test]
+    fn parse_symbol_rules_reads_known_filters_and_skips_malformed_ones() {
+        let info = BinanceSymbolInfo {
+            symbol: "BTCUSDT".to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            filters: vec![
+                serde_json::json!({"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "10", "stepSize": "0.001"}),
+                serde_json::json!({"filterType": "NOTIONAL", "minNotional": "5"}),
+                serde_json::json!({"minQty": "9.9"}),
+                serde_json::json!({"filterType": "SOME_FUTURE_FILTER", "value": "1"}),
+            ],
+        };
+
+        let rules = parse_symbol_rules(info).expect("rules");
+        assert_eq!(
+            rules.min_qty,
+            Some(Decimal::from_str_exact("0.001").expect("decimal"))
+        );
+        assert_eq!(rules.max_qty, Some(Decimal::from(10)));
+        assert_eq!(rules.min_notional, Some(Decimal::from(5)));
+        // The malformed filter (no filterType) must not leak its minQty in.
+        assert_eq!(
+            rules.effective_market_min_qty(),
+            Some(Decimal::from_str_exact("0.001").expect("decimal"))
+        );
+    }
+
+    // Query/openOrders-style responses report quantities but never fills:
+    // net quantity must be None instead of silently skipping fee deduction.
+    #[test]
+    fn parse_order_query_response_without_fills_reports_none_net_qty() {
+        let raw = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "orderId": 7,
+            "clientOrderId": "abc",
+            "side": "SELL",
+            "type": "MARKET",
+            "status": "FILLED",
+            "executedQty": "0.01000000",
+            "cummulativeQuoteQty": "100.00000000"
+        });
+
+        let order = parse_order(raw).expect("order");
+        assert_eq!(
+            order.executed_qty,
+            Some(Decimal::from_str_exact("0.01000000").expect("decimal"))
+        );
+        assert_eq!(order.fills, None);
+        assert_eq!(order.net_base_qty_after_base_fees("BTC"), None);
+        assert_eq!(
+            order.average_price(),
+            Some(Decimal::from_str_exact("10000").expect("decimal"))
+        );
     }
 }
