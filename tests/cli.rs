@@ -20,7 +20,8 @@ fn data_validate_reports_the_requested_interval() {
     let db_path = tempdir.path().join("market.sqlite");
 
     let mut cmd = Command::cargo_bin("quantforge").expect("binary");
-    cmd.arg("--db")
+    cmd.env_remove("QF_BINANCE_BASE_URL")
+        .arg("--db")
         .arg(&db_path)
         .arg("--log-level")
         .arg("error")
@@ -36,4 +37,28 @@ fn data_validate_reports_the_requested_interval() {
         .success()
         .stdout(predicate::str::contains("market: binance_spot BTCUSDT 8h"))
         .stdout(predicate::str::contains("candles: 0"));
+}
+
+#[test]
+fn data_validate_rejects_invalid_interval_with_clear_error() {
+    let tempdir = tempdir().expect("tempdir");
+    let db_path = tempdir.path().join("market.sqlite");
+
+    let mut cmd = Command::cargo_bin("quantforge").expect("binary");
+    cmd.env_remove("QF_BINANCE_BASE_URL")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--log-level")
+        .arg("error")
+        .args([
+            "data",
+            "validate",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "7m",
+        ]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid interval: 7m"));
 }
