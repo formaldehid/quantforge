@@ -7,7 +7,16 @@ use time::OffsetDateTime;
 pub type TimestampMs = i64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Symbol(String);
+
+impl TryFrom<String> for Symbol {
+    type Error = ModelError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl Symbol {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -313,6 +322,12 @@ pub struct Fill {
     pub trade_id: Option<i64>,
 }
 
+/// Exchange-reported order state.
+///
+/// `executed_qty`, `cumulative_quote_qty`, and `fills` are `None` when the
+/// exchange response did not report them (e.g. ACK-style responses, or the
+/// open-orders endpoint which never includes fills). `None` means
+/// "not reported" and is deliberately distinct from a reported zero.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExchangeOrder {
     pub symbol: Symbol,
@@ -323,11 +338,11 @@ pub struct ExchangeOrder {
     pub client_order_id: Option<String>,
     pub requested_qty: Option<Decimal>,
     pub requested_quote_qty: Option<Decimal>,
-    pub executed_qty: Decimal,
-    pub cumulative_quote_qty: Decimal,
+    pub executed_qty: Option<Decimal>,
+    pub cumulative_quote_qty: Option<Decimal>,
     pub avg_price: Option<Decimal>,
     pub transact_time_ms: Option<TimestampMs>,
-    pub fills: Vec<Fill>,
+    pub fills: Option<Vec<Fill>>,
     pub raw: serde_json::Value,
 }
 
@@ -336,15 +351,26 @@ impl ExchangeOrder {
         if let Some(price) = self.avg_price {
             return Some(price);
         }
-        if self.executed_qty > Decimal::ZERO {
-            return Some(self.cumulative_quote_qty / self.executed_qty);
+        match (self.executed_qty, self.cumulative_quote_qty) {
+            (Some(executed), Some(cumulative)) if executed > Decimal::ZERO => {
+                Some(cumulative / executed)
+            }
+            _ => None,
         }
-        None
     }
 
-    pub fn net_base_qty_after_base_fees(&self, base_asset: &str) -> Decimal {
-        let mut qty = self.executed_qty;
-        for fill in &self.fills {
+    /// Executed quantity minus fees charged in the base asset.
+    ///
+    /// Returns `None` when the exchange did not report the executed quantity
+    /// or the fills, so callers must decide explicitly instead of assuming a
+    /// fee-free fill. Fills without a `commission_asset` are treated as not
+    /// charged in the base asset (under-deduction is surfaced by the fill
+    /// itself, never invented).
+    pub fn net_base_qty_after_base_fees(&self, base_asset: &str) -> Option<Decimal> {
+        let executed = self.executed_qty?;
+        let fills = self.fills.as_ref()?;
+        let mut qty = executed;
+        for fill in fills {
             if fill
                 .commission_asset
                 .as_deref()
@@ -354,7 +380,7 @@ impl ExchangeOrder {
                 qty -= fill.commission;
             }
         }
-        qty.max(Decimal::ZERO)
+        Some(qty.max(Decimal::ZERO))
     }
 }
 
@@ -456,6 +482,7 @@ pub struct BotRunState {
     pub market: MarketId,
     pub strategy_name: String,
     pub strategy_config: serde_json::Value,
+    pub execution_mode: ExecutionMode,
     pub status: RunStatus,
     pub last_processed_open_time_ms: Option<TimestampMs>,
     pub started_at_ms: TimestampMs,
@@ -492,22 +519,23 @@ pub fn parse_rfc3339_to_ms(input: &str) -> Result<TimestampMs, ModelError> {
     Ok(dt.unix_timestamp() * 1000 + i64::from(dt.millisecond()))
 }
 
+/// Formats epoch milliseconds as an RFC 3339 timestamp for display.
+///
+/// Values outside the representable datetime range render as an explicit
+/// `invalid-ms(<value>)` marker instead of silently falling back to a
+/// plausible-looking epoch date.
 pub fn ms_to_rfc3339(ms: TimestampMs) -> String {
     let seconds = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000) as u16;
 
-    let dt = match OffsetDateTime::from_unix_timestamp(seconds) {
-        Ok(dt) => match dt.replace_millisecond(millis) {
-            Ok(adjusted) => adjusted,
-            Err(_) => OffsetDateTime::UNIX_EPOCH,
-        },
-        Err(_) => OffsetDateTime::UNIX_EPOCH,
-    };
-
-    match dt.format(&time::format_description::well_known::Rfc3339) {
-        Ok(value) => value,
-        Err(_) => "1970-01-01T00:00:00Z".to_string(),
-    }
+    OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|dt| dt.replace_millisecond(millis).ok())
+        .and_then(|dt| {
+            dt.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| format!("invalid-ms({ms})"))
 }
 
 pub fn now_utc_ms() -> TimestampMs {
@@ -515,7 +543,16 @@ pub fn now_utc_ms() -> TimestampMs {
     now.unix_timestamp() * 1000 + i64::from(now.millisecond())
 }
 
+/// Rounds `value` down to the nearest multiple of `step`.
+///
+/// `step` must be positive; passing a non-positive step is a caller bug.
+/// Debug builds assert. Release builds return `value` unchanged so a bad
+/// step can never manufacture a different quantity.
 pub fn round_down_to_step(value: Decimal, step: Decimal) -> Decimal {
+    debug_assert!(
+        step > Decimal::ZERO,
+        "round_down_to_step requires a positive step, got {step}"
+    );
     if step <= Decimal::ZERO {
         return value;
     }
@@ -644,6 +681,20 @@ mod tests {
     }
 
     #[test]
+    fn ms_to_rfc3339_formats_valid_timestamps() {
+        assert_eq!(ms_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(ms_to_rfc3339(1_500), "1970-01-01T00:00:01.5Z");
+    }
+
+    #[test]
+    fn ms_to_rfc3339_marks_out_of_range_timestamps_instead_of_epoch() {
+        let rendered = ms_to_rfc3339(i64::MAX);
+        assert_eq!(rendered, format!("invalid-ms({})", i64::MAX));
+        let rendered = ms_to_rfc3339(i64::MIN);
+        assert_eq!(rendered, format!("invalid-ms({})", i64::MIN));
+    }
+
+    #[test]
     fn validation_detects_gap() {
         let candles = vec![
             Candle {
@@ -684,11 +735,11 @@ mod tests {
             client_order_id: Some("abc".to_string()),
             requested_qty: None,
             requested_quote_qty: Some(Decimal::from_str("100").expect("decimal")),
-            executed_qty: Decimal::from_str("0.01").expect("decimal"),
-            cumulative_quote_qty: Decimal::from_str("100").expect("decimal"),
+            executed_qty: Some(Decimal::from_str("0.01").expect("decimal")),
+            cumulative_quote_qty: Some(Decimal::from_str("100").expect("decimal")),
             avg_price: None,
             transact_time_ms: Some(1),
-            fills: Vec::new(),
+            fills: Some(Vec::new()),
             raw: serde_json::json!({}),
         };
 
@@ -899,5 +950,105 @@ mod tests {
             "\t1d\n".parse::<Interval>().expect("interval"),
             Interval::D1
         );
+    }
+
+    /// Inputs `Symbol::new` must accept, paired with the normalized form.
+    const VALID_SYMBOL_CASES: [(&str, &str); 3] = [
+        ("BTCUSDT", "BTCUSDT"),
+        ("btcusdt", "BTCUSDT"),
+        ("  ethusdt  ", "ETHUSDT"),
+    ];
+
+    #[test]
+    fn symbol_new_trims_uppercases_and_preserves_valid_input() {
+        for (input, expected) in VALID_SYMBOL_CASES {
+            let symbol = Symbol::new(input).expect("symbol");
+            assert_eq!(symbol.as_str(), expected, "for input {input:?}");
+        }
+    }
+
+    #[test]
+    fn empty_symbols_are_rejected_with_exact_message() {
+        for input in ["", "   ", "\t\n"] {
+            let error = Symbol::new(input).expect_err("symbol error");
+            assert!(
+                matches!(error, ModelError::InvalidSymbol(_)),
+                "for input {input:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "invalid symbol: empty",
+                "for input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_serializes_as_plain_string() {
+        let symbol = Symbol::new("BTCUSDT").expect("symbol");
+        let json = serde_json::to_string(&symbol).expect("serialize symbol");
+        assert_eq!(json, "\"BTCUSDT\"");
+    }
+
+    // Deserialization must apply the same normalization as `Symbol::new`;
+    // the derived impl used to bypass it entirely on `state_json`/`raw_json`
+    // reloads from storage.
+    #[test]
+    fn symbol_deserialization_normalizes_like_new() {
+        for (input, expected) in VALID_SYMBOL_CASES {
+            let json = serde_json::to_string(input).expect("encode input");
+            let symbol: Symbol = serde_json::from_str(&json).expect("deserialize symbol");
+            assert_eq!(symbol.as_str(), expected, "for input {input:?}");
+        }
+    }
+
+    #[test]
+    fn symbol_deserialization_rejects_empty_with_model_error_message() {
+        for raw in ["\"\"", "\"  \""] {
+            let error = serde_json::from_str::<Symbol>(raw).expect_err("deserialize error");
+            assert!(
+                error.to_string().contains("invalid symbol: empty"),
+                "for input {raw:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_round_trips_through_serde_json() {
+        let symbol = Symbol::new("BTCUSDT").expect("symbol");
+        let json = serde_json::to_string(&symbol).expect("serialize symbol");
+        let parsed: Symbol = serde_json::from_str(&json).expect("deserialize symbol");
+        assert_eq!(parsed, symbol);
+    }
+
+    // `execution_mode` is part of a run's identity: state_json without it is
+    // from an unsupported schema generation and must fail to load, never
+    // default to a mode.
+    #[test]
+    fn bot_run_state_without_execution_mode_field_is_rejected() {
+        let json = serde_json::json!({
+            "run_id": "run-legacy",
+            "market": {"exchange": "BinanceSpot", "symbol": "BTCUSDT", "interval": "M1"},
+            "strategy_name": "sma_cross",
+            "strategy_config": {"kind": "sma_cross", "fast": 20, "slow": 50},
+            "status": "Running",
+            "last_processed_open_time_ms": null,
+            "started_at_ms": 0,
+            "updated_at_ms": 0,
+            "stopped_at_ms": null,
+            "last_error": null,
+            "position": {"qty": "0", "entry_price": null, "entry_time_ms": null, "entry_order_id": null}
+        });
+        let error = serde_json::from_value::<BotRunState>(json)
+            .expect_err("state without execution_mode must not load");
+        assert!(error.to_string().contains("execution_mode"), "got {error}");
+    }
+
+    #[test]
+    fn market_id_json_with_lowercase_symbol_normalizes_on_deserialize() {
+        let json = r#"{"exchange":"BinanceSpot","symbol":"btcusdt","interval":"M1"}"#;
+        let market: MarketId = serde_json::from_str(json).expect("deserialize market");
+        assert_eq!(market.symbol.as_str(), "BTCUSDT");
+        assert_eq!(market.interval, Interval::M1);
     }
 }

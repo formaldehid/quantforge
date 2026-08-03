@@ -18,6 +18,18 @@ pub struct DataSyncConfig {
 pub struct DataSyncSummary {
     pub iterations: usize,
     pub written: usize,
+    /// Open time of the first candle written by this sync, if any. Together
+    /// with `last_open_time_ms` this reports the actually covered range, which
+    /// can be smaller than the requested one when the exchange has no data.
+    pub first_synced_open_time_ms: Option<i64>,
+    pub last_open_time_ms: Option<i64>,
+}
+
+/// Coverage achieved by a single `sync_market_range` call.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SyncRangeOutcome {
+    pub written: usize,
+    pub first_open_time_ms: Option<i64>,
     pub last_open_time_ms: Option<i64>,
 }
 
@@ -42,13 +54,16 @@ impl<'a> DataSyncEngine<'a> {
         let mut loops = 0usize;
         let step_ms = cfg.market.interval.step_ms();
         let mut next_start_time_ms = initial_start_time_ms(cfg, now_utc_ms());
+        // Assigned on every loop iteration; the loop body runs at least once.
+        let mut last_effective_end_ms: i64;
 
         loop {
             let now_ms = now_utc_ms();
             let end_time_ms = effective_end_time_ms(cfg, now_ms);
+            last_effective_end_ms = end_time_ms;
 
             if next_start_time_ms <= end_time_ms {
-                let written = sync_market_range(
+                let outcome = sync_market_range(
                     self.source,
                     self.store,
                     &cfg.market,
@@ -57,7 +72,10 @@ impl<'a> DataSyncEngine<'a> {
                     cfg.batch_limit,
                 )
                 .await?;
-                summary.written += written;
+                summary.written += outcome.written;
+                if summary.first_synced_open_time_ms.is_none() {
+                    summary.first_synced_open_time_ms = outcome.first_open_time_ms;
+                }
                 summary.last_open_time_ms = self.store.max_open_time_ms(&cfg.market)?;
 
                 if let Some(max_open_time_ms) = summary.last_open_time_ms {
@@ -65,7 +83,7 @@ impl<'a> DataSyncEngine<'a> {
                 }
 
                 info!(
-                    written,
+                    written = outcome.written,
                     total_written = summary.written,
                     next_start_time_ms,
                     last_open_time_ms = ?summary.last_open_time_ms,
@@ -87,6 +105,17 @@ impl<'a> DataSyncEngine<'a> {
             if sleep_or_shutdown(cfg.poll_interval).await {
                 break;
             }
+        }
+
+        // A bounded sync that ends before reaching its end boundary leaves a
+        // gap the operator would otherwise only discover via `data validate`.
+        if cfg.end_time_ms.is_some() && next_start_time_ms <= last_effective_end_ms {
+            warn!(
+                uncovered_start_ms = next_start_time_ms,
+                uncovered_end_ms = last_effective_end_ms,
+                "bounded sync ended with an uncovered range; the exchange returned \
+                 no candles for it"
+            );
         }
 
         Ok(summary)
@@ -121,14 +150,14 @@ pub(crate) async fn sync_market_range(
     start_ms: i64,
     end_ms: i64,
     batch_limit: u16,
-) -> Result<usize, EngineError> {
+) -> Result<SyncRangeOutcome, EngineError> {
+    let mut outcome = SyncRangeOutcome::default();
     if end_ms < start_ms {
-        return Ok(0);
+        return Ok(outcome);
     }
 
     let step_ms = market.interval.step_ms();
     let mut cursor = start_ms;
-    let mut total = 0usize;
 
     while cursor <= end_ms {
         let batch = source
@@ -145,12 +174,16 @@ pub(crate) async fn sync_market_range(
             break;
         }
 
-        total += store.upsert_candles(market, &batch)?;
+        outcome.written += store.upsert_candles(market, &batch)?;
+        if outcome.first_open_time_ms.is_none() {
+            outcome.first_open_time_ms = batch.first().map(|candle| candle.open_time_ms);
+        }
 
         let last_open_time_ms = batch
             .last()
             .map(|candle| candle.open_time_ms)
             .ok_or_else(|| EngineError::InvalidState("expected non-empty batch".to_string()))?;
+        outcome.last_open_time_ms = Some(last_open_time_ms);
         let next_cursor = last_open_time_ms + step_ms;
         if next_cursor <= cursor {
             warn!(cursor, next_cursor, "data sync cursor did not advance");
@@ -159,7 +192,7 @@ pub(crate) async fn sync_market_range(
         cursor = next_cursor;
     }
 
-    Ok(total)
+    Ok(outcome)
 }
 
 pub(crate) async fn sleep_or_shutdown(duration: Duration) -> bool {
@@ -233,5 +266,84 @@ mod tests {
         let cfg = config(Some(1_000), Some(5_000), true);
         assert!(should_continue(&cfg, 5_000, 1));
         assert!(!should_continue(&cfg, 5_001, 1));
+    }
+
+    use crate::{Candle, ExchangeError, SqliteStore, Symbol as ModelSymbol, SymbolRules};
+    use rust_decimal::Decimal;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct ScriptedSource {
+        batches: Mutex<VecDeque<Vec<Candle>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MarketDataSource for ScriptedSource {
+        fn exchange_id(&self) -> ExchangeId {
+            ExchangeId::BinanceSpot
+        }
+
+        async fn fetch_klines(
+            &self,
+            _request: &KlineRequest,
+        ) -> Result<Vec<Candle>, ExchangeError> {
+            Ok(self
+                .batches
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        async fn fetch_symbol_rules(
+            &self,
+            _symbol: &ModelSymbol,
+        ) -> Result<SymbolRules, ExchangeError> {
+            unreachable!("data sync never fetches symbol rules")
+        }
+    }
+
+    fn candle(open_time_ms: i64) -> Candle {
+        Candle {
+            open_time_ms,
+            close_time_ms: open_time_ms + 59_999,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: Decimal::ONE,
+            trades: Some(1),
+        }
+    }
+
+    // A bounded sync where the exchange stops returning data mid-range must
+    // still report the range it actually covered (and warns about the rest).
+    #[tokio::test]
+    async fn bounded_sync_reports_covered_range_when_exchange_runs_dry() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::new(tempdir.path().join("market.sqlite"));
+        CandleStore::init(&store).expect("init");
+
+        let source = ScriptedSource {
+            batches: Mutex::new(VecDeque::from([vec![candle(0), candle(60_000)]])),
+        };
+        let engine = DataSyncEngine::new(&source, &store);
+
+        let summary = engine
+            .run(&DataSyncConfig {
+                market: market(),
+                start_time_ms: Some(0),
+                end_time_ms: Some(300_000),
+                batch_limit: 1000,
+                follow: false,
+                poll_interval: Duration::from_millis(1),
+                max_loops: Some(1),
+            })
+            .await
+            .expect("sync");
+
+        assert_eq!(summary.written, 2);
+        assert_eq!(summary.first_synced_open_time_ms, Some(0));
+        assert_eq!(summary.last_open_time_ms, Some(60_000));
     }
 }

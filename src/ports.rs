@@ -89,6 +89,13 @@ pub enum StorageError {
 
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    #[error(
+        "database schema version {found} does not match the supported version {expected}; \
+         use a matching quantforge release or re-create the database (candles can be \
+         re-synced with `data sync`)"
+    )]
+    SchemaVersionMismatch { found: String, expected: String },
 }
 
 impl StorageError {

@@ -13,16 +13,6 @@ pub struct BacktestConfig {
     pub close_out_at_end: bool,
 }
 
-impl Default for BacktestConfig {
-    fn default() -> Self {
-        Self {
-            initial_cash: Decimal::from(10_000),
-            fee_bps: Decimal::from(10),
-            close_out_at_end: true,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct BacktestResult {
     pub initial_cash: Decimal,
@@ -51,6 +41,18 @@ impl BacktestEngine {
     ) -> Result<BacktestResult, EngineError> {
         if candles.is_empty() {
             return Err(EngineError::NoCandles);
+        }
+        if self.cfg.initial_cash <= Decimal::ZERO {
+            return Err(EngineError::InvalidConfig(format!(
+                "initial_cash must be greater than 0, got {}",
+                self.cfg.initial_cash
+            )));
+        }
+        if self.cfg.fee_bps < Decimal::ZERO {
+            return Err(EngineError::InvalidConfig(format!(
+                "fee_bps must be zero or greater, got {}",
+                self.cfg.fee_bps
+            )));
         }
 
         let fee_rate = self.cfg.fee_bps / Decimal::from(10_000);
@@ -130,13 +132,13 @@ impl BacktestEngine {
         ctx.position_qty = qty;
         strategy.on_finish(&mut ctx)?;
 
-        let last_close = candles.last().map(|c| c.close).unwrap_or(Decimal::ZERO);
+        let last_close = candles
+            .last()
+            .map(|c| c.close)
+            .ok_or_else(|| EngineError::InvalidState("no candles at close-out".to_string()))?;
         let final_equity = cash + qty * last_close;
-        let total_return_pct = if self.cfg.initial_cash == Decimal::ZERO {
-            Decimal::ZERO
-        } else {
-            (final_equity - self.cfg.initial_cash) / self.cfg.initial_cash * Decimal::from(100)
-        };
+        let total_return_pct =
+            (final_equity - self.cfg.initial_cash) / self.cfg.initial_cash * Decimal::from(100);
 
         info!(
             strategy = strategy.name(),
@@ -340,5 +342,49 @@ mod tests {
         assert_eq!(result.trades[0].exit_price, Decimal::from(120));
         assert!(result.final_equity > Decimal::from(1_000));
         assert!(result.trades[0].gross_quote_pnl > Decimal::ZERO);
+    }
+
+    #[test]
+    fn backtest_rejects_non_positive_initial_cash() {
+        let candles = vec![candle(0, "100", "100")];
+        let mut strategy = ScriptedStrategy { targets: vec![] };
+
+        for cash in [Decimal::ZERO, Decimal::from(-100)] {
+            let error = BacktestEngine::new(BacktestConfig {
+                initial_cash: cash,
+                fee_bps: Decimal::ZERO,
+                close_out_at_end: true,
+            })
+            .run(&market(), &candles, &mut strategy)
+            .expect_err("config error");
+            assert!(
+                matches!(error, EngineError::InvalidConfig(_)),
+                "for cash {cash}"
+            );
+            assert!(
+                error.to_string().contains("initial_cash must be greater"),
+                "for cash {cash}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn backtest_rejects_negative_fee_bps() {
+        let candles = vec![candle(0, "100", "100")];
+        let mut strategy = ScriptedStrategy { targets: vec![] };
+
+        let error = BacktestEngine::new(BacktestConfig {
+            initial_cash: Decimal::from(1_000),
+            fee_bps: Decimal::from(-1),
+            close_out_at_end: true,
+        })
+        .run(&market(), &candles, &mut strategy)
+        .expect_err("config error");
+        assert!(matches!(error, EngineError::InvalidConfig(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("fee_bps must be zero or greater")
+        );
     }
 }

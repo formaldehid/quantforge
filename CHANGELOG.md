@@ -8,11 +8,30 @@ All notable changes to this project will be documented in this file.
 
 - ci runs on pull requests targeting `main` instead of on every push and pull request, removing duplicate workflow runs
 - superseded ci runs for the same pull request are cancelled automatically
+- `data validate` exits non-zero when validation issues are found
+- the CLI rejects non-positive `--cash` and `--quote-order-qty`, negative `--fee-bps`, and `--poll-secs 0` before touching the database or network
+- exchange order responses no longer coerce missing fill data to zero: unreported executed quantity, quote quantity, and fills are `None` on `ExchangeOrder`, and the trading engine refuses to update position state from an order without a reported executed quantity
+- closed trades are never recorded with fabricated prices: `trade close` and the live exit update position state, then fail with a clear error instead of writing a trade row when entry or exit fill data is missing
+- dry-run applies the same pre-trade checks as live (min-notional on entries); live sells are validated against the exchange minimum (dust is skipped with a warning) and maximum quantity rules
+- resuming a run by `--run-id` now verifies market, strategy name and parameters, and execution mode and refuses mismatches; `BotRunState` records its execution mode, and `trade close` refuses runs recorded in dry-run mode
+- an executed order is always reflected in position state even when journaling the order event fails; the journaling failure is surfaced afterwards with reconciliation guidance
+- an unsellable dust remnant left after an exit or manual close is written off with a warning instead of wedging the run in a permanently open position
+- opening a database with a mismatched schema version fails with actionable guidance instead of proceeding silently
+- the SQLite schema version is now 3 (`BotRunState` gained a required `execution_mode` field); until 1.0.0 schema changes are not backward compatible and there are no migrations — delete the database and re-sync
+- data sync summaries report the first synced candle, and bounded syncs warn when the exchange returned no candles for part of the requested window
+- startup logs the effective Binance base URL, warns when `trade run --mode live` uses the production endpoint via the built-in default, and warns when the database file did not exist and was created empty
+- `ms_to_rfc3339` renders out-of-range timestamps as an explicit `invalid-ms(...)` marker instead of a plausible epoch date
+- backtests reject non-positive initial cash and negative fees at the engine level; the live bootstrap window uses checked arithmetic
+
+### Removed
+
+- `BacktestConfig` no longer implements `Default`; construct its fields explicitly instead of relying on fabricated cash and fee values
 
 ### Fixed
 
 - `Interval::H8` now formats as `8h` instead of `1m`
 - re-sync any 8h candles written before this fix; they were stored under the `1m` interval key
+- `Symbol` deserialization now validates and normalizes (trim, uppercase, reject empty) exactly like `Symbol::new`, closing the bypass on `state_json`/`raw_json` reloads
 
 ## [0.2.0] - 2026-03-21
 

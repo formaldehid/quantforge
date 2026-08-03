@@ -11,7 +11,12 @@ use std::{
 };
 use tracing::info;
 
-const SCHEMA_VERSION: &str = "2";
+/// Version stamp for the SQLite schema, compared on every `init`.
+///
+/// Bump this when the DDL below or the shape of `state_json`/`raw_json`
+/// changes incompatibly. Until 1.0.0 there is no backward compatibility and
+/// no migrations: a version mismatch means delete the database and re-sync.
+const SCHEMA_VERSION: &str = "3";
 
 #[derive(Clone, Debug)]
 pub struct SqliteStore {
@@ -121,6 +126,23 @@ impl SqliteStore {
                 "#,
             )
             .map_err(StorageError::other)?;
+
+        let existing_version: Option<String> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::other)?;
+        if let Some(found) = existing_version {
+            if found != SCHEMA_VERSION {
+                return Err(StorageError::SchemaVersionMismatch {
+                    found,
+                    expected: SCHEMA_VERSION.to_string(),
+                });
+            }
+        }
 
         connection
             .execute(
@@ -331,6 +353,10 @@ impl RunJournalStore for SqliteStore {
         self.initialize_schema()
     }
 
+    // `state_json` is the single source of truth for run state; the
+    // `status`, `stopped_at_ms`, and `last_error` columns are denormalized
+    // copies for ad-hoc SQL/display only and are never read back into a
+    // `BotRunState`.
     fn save_run_state(&self, state: &BotRunState) -> Result<(), StorageError> {
         let connection = self.open()?;
         let state_json = serde_json::to_string(state).map_err(StorageError::other)?;
@@ -642,6 +668,7 @@ mod tests {
             strategy_config: serde_json::json!({"kind":"sma_cross","fast":20,"slow":50}),
             status: RunStatus::Running,
             last_processed_open_time_ms: Some(1_700_000_000_000),
+            execution_mode: crate::ExecutionMode::DryRun,
             started_at_ms: now_utc_ms(),
             updated_at_ms: now_utc_ms(),
             stopped_at_ms: None,
@@ -665,11 +692,11 @@ mod tests {
             client_order_id: Some("abc".to_string()),
             requested_qty: None,
             requested_quote_qty: Some(Decimal::from_str("100").expect("decimal")),
-            executed_qty: Decimal::from_str("0.01").expect("decimal"),
-            cumulative_quote_qty: Decimal::from_str("100").expect("decimal"),
+            executed_qty: Some(Decimal::from_str("0.01").expect("decimal")),
+            cumulative_quote_qty: Some(Decimal::from_str("100").expect("decimal")),
             avg_price: Some(Decimal::from_str("10000").expect("decimal")),
             transact_time_ms: Some(1),
-            fills: Vec::new(),
+            fills: Some(Vec::new()),
             raw: serde_json::json!({}),
         };
         store
@@ -703,6 +730,37 @@ mod tests {
                 .expect("list trade")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn init_rejects_databases_with_a_different_schema_version() {
+        let tempdir = tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("market.sqlite");
+
+        let store = SqliteStore::new(&db_path);
+        CandleStore::init(&store).expect("first init");
+
+        let connection = Connection::open(&db_path).expect("open");
+        connection
+            .execute(
+                "UPDATE meta SET value = '1' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("doctor version");
+        drop(connection);
+
+        let error = CandleStore::init(&store).expect_err("version mismatch");
+        assert!(matches!(error, StorageError::SchemaVersionMismatch { .. }));
+        assert!(
+            error.to_string().contains("schema version 1"),
+            "got {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("supported version {SCHEMA_VERSION}")),
+            "got {error}"
         );
     }
 }
