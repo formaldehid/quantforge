@@ -46,8 +46,31 @@ Internal boundaries still exist as Rust modules:
 - strategy execution model: closed-bar, event-driven
 - built-in strategy in 0.2.0: SMA crossover example
 - default execution mode: **dry-run**
-- live order placement requires explicit `--mode live` and Binance credentials from
-  environment variables
+- live order placement requires explicit `--mode live`, a confirmation (`--yes`
+  or an interactive prompt), and Binance credentials from environment variables
+
+## Dry-run vs live
+
+`trade run` has two execution modes selected with `--mode`; the default is
+**dry-run**.
+
+- **dry-run** evaluates the strategy on real synced candles, but the engine is
+  constructed without a trading venue, so no order can be sent at all. It needs
+  no credentials and no confirmation.
+- **live** places real spot market orders. It requires `--mode live`, Binance
+  credentials in `QF_BINANCE_API_KEY` / `QF_BINANCE_API_SECRET`, and an
+  explicit confirmation:
+  - on an interactive terminal, the CLI shows the strategy, market, and
+    endpoint, then asks you to type `yes`;
+  - with `--yes`, the prompt is skipped (for scripts and supervisors);
+  - non-interactively without `--yes`, the CLI prints a preview of the would-be
+    run and exits with status 0 without trading.
+
+Automation must pass `--yes` and should treat output without a `run_id:` line
+as "the bot did not run". When the endpoint is a production Binance host, the
+confirmation and logs mark it with `(PRODUCTION)`; this is a guardrail against
+operator mistakes, not a security boundary — prefer a dedicated `--db` and
+`https://testnet.binance.vision/` while testing.
 
 ## Credentials
 
@@ -132,6 +155,7 @@ cargo run -- \
   --slow 50 \
   --quote-order-qty 100 \
   --mode live \
+  --yes \
   --bootstrap-enter \
   --poll-secs 5
 ```
