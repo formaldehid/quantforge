@@ -13,6 +13,7 @@ use quantforge::{
     validate_candles,
 };
 use rust_decimal::Decimal;
+use std::io::{self, IsTerminal, Write};
 use std::{path::PathBuf, time::Duration};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -166,6 +167,8 @@ struct TradeRunArgs {
     quote_order_qty: String,
     #[arg(long, value_enum, default_value_t = CliExecutionMode::DryRun)]
     mode: CliExecutionMode,
+    #[arg(long, default_value_t = false)]
+    yes: bool,
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     poll_secs: u64,
     #[arg(long, default_value_t = 300)]
@@ -317,21 +320,7 @@ async fn main() -> Result<()> {
 
     let base_url =
         Url::parse(&cli.binance_base_url).context("failed to parse --binance-base-url")?;
-    info!(base_url = %base_url, "using Binance base URL");
-    if let Command::Trade {
-        command: TradeCommand::Run(args),
-    } = &cli.command
-    {
-        if matches!(args.mode, CliExecutionMode::Live)
-            && cli.binance_base_url == DEFAULT_BINANCE_BASE_URL
-        {
-            warn!(
-                "live mode is using the PRODUCTION Binance endpoint via the built-in default; \
-                 set --binance-base-url or QF_BINANCE_BASE_URL explicitly \
-                 (https://testnet.binance.vision/ for testnet)"
-            );
-        }
-    }
+    info!(base_url = %display_url(&base_url), "using Binance base URL");
     let public_client = BinanceSpotClient::new(base_url.clone());
     let private_client = BinanceCredentials::from_env()
         .map(|credentials| BinanceSpotClient::new(base_url.clone()).with_credentials(credentials));
@@ -344,7 +333,14 @@ async fn main() -> Result<()> {
         Command::Backtest(args) => handle_backtest(&store, args)?,
         Command::Trade { command } => match command {
             TradeCommand::Run(args) => {
-                handle_trade_run(&store, &public_client, private_client.as_ref(), args).await?
+                handle_trade_run(
+                    &store,
+                    &public_client,
+                    private_client.as_ref(),
+                    &base_url,
+                    args,
+                )
+                .await?
             }
             TradeCommand::Close(args) => {
                 let private_client = private_client.as_ref().ok_or_else(|| {
@@ -417,6 +413,32 @@ fn parse_non_negative_decimal(flag: &str, raw: &str) -> Result<Decimal> {
         bail!("{flag} must be zero or greater, got {raw}");
     }
     Ok(value)
+}
+
+const PRODUCTION_BINANCE_DOMAINS: [&str; 2] = ["binance.com", "binance.us"];
+
+fn is_production_binance_url(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    PRODUCTION_BINANCE_DOMAINS.iter().any(|domain| {
+        host == *domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn display_url(url: &Url) -> Url {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    redacted
+}
+
+fn confirmation_is_yes(input: &str) -> bool {
+    input.trim().eq_ignore_ascii_case("yes")
 }
 
 fn strategy_config(fast: usize, slow: usize) -> BuiltInStrategyConfig {
@@ -567,10 +589,64 @@ async fn handle_trade_run(
     store: &SqliteStore,
     public_client: &BinanceSpotClient,
     private_client: Option<&BinanceSpotClient>,
+    base_url: &Url,
     args: TradeRunArgs,
 ) -> Result<()> {
     let market = parse_market(args.symbol, args.interval)?;
     let quote_order_qty = parse_positive_decimal("--quote-order-qty", &args.quote_order_qty)?;
+
+    if matches!(args.mode, CliExecutionMode::Live) {
+        if !args.yes {
+            let strategy_name = strategy_config(args.fast, args.slow).strategy_name();
+            let url_note = if is_production_binance_url(base_url) {
+                " (PRODUCTION)"
+            } else {
+                ""
+            };
+            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+            if !interactive {
+                println!("refusing to start live trading without --yes");
+                println!(
+                    "would run strategy {} on {} {} {}",
+                    strategy_name, market.exchange, market.symbol, market.interval
+                );
+                println!("with REAL orders via {}{}", display_url(base_url), url_note);
+                if args.bootstrap_enter {
+                    println!("note: --bootstrap-enter may place an order on the first loop");
+                }
+                println!("re-run with --yes to confirm, or use --mode dry-run");
+                return Ok(());
+            }
+            println!("about to start live trading:");
+            println!(
+                "strategy {} on {} {} {}",
+                strategy_name, market.exchange, market.symbol, market.interval
+            );
+            println!("REAL orders via {}{}", display_url(base_url), url_note);
+            if args.bootstrap_enter {
+                println!("note: --bootstrap-enter may place an order on the first loop");
+            }
+            print!("type 'yes' to confirm, anything else aborts: ");
+            io::stdout()
+                .flush()
+                .context("failed to flush confirmation prompt")?;
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .context("failed to read live-trading confirmation")?;
+            if !confirmation_is_yes(&input) {
+                println!("aborted; no orders sent");
+                return Ok(());
+            }
+        }
+        if is_production_binance_url(base_url) {
+            warn!(
+                base_url = %display_url(base_url),
+                "live trading against PRODUCTION Binance; real funds at risk"
+            );
+        }
+    }
+
     let engine = LiveTradeEngine::new(
         public_client,
         store,
@@ -1067,5 +1143,58 @@ mod tests {
             error.to_string().contains("failed to parse --cash: abc"),
             "got {error:#}"
         );
+    }
+
+    #[test]
+    fn production_classifier_matches_production_hosts() {
+        for raw in [
+            "https://api.binance.com/",
+            "https://api1.binance.com/",
+            "https://api2.binance.com/",
+            "https://api3.binance.com/",
+            "https://api4.binance.com/",
+            "https://api-gcp.binance.com/",
+            "https://api5.binance.com/",
+            "https://api.binance.us/",
+            "https://binance.com/",
+            "https://API.BINANCE.COM/",
+            "https://api.binance.com:8443/",
+            "https://api.binance.com./",
+            "http://api1.binance.com/some/path",
+        ] {
+            let url = Url::parse(raw).expect("url");
+            assert!(is_production_binance_url(&url), "for input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn production_classifier_rejects_testnet_local_and_lookalike_hosts() {
+        for raw in [
+            "https://testnet.binance.vision/",
+            "https://data-api.binance.vision/",
+            "http://127.0.0.1:9/",
+            "https://evil-binance.com/",
+            "https://api.binance.com.evil.example/",
+            "file:///tmp/no-host",
+        ] {
+            let url = Url::parse(raw).expect("url");
+            assert!(!is_production_binance_url(&url), "for input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn display_url_strips_userinfo() {
+        let url = Url::parse("https://user:secret@api.binance.com/").expect("url");
+        assert_eq!(display_url(&url).as_str(), "https://api.binance.com/");
+    }
+
+    #[test]
+    fn live_confirmation_accepts_only_yes() {
+        for input in ["yes", "YES", " yes \n", "Yes"] {
+            assert!(confirmation_is_yes(input), "for input {input:?}");
+        }
+        for input in ["", "y", "no", "live", "yes please"] {
+            assert!(!confirmation_is_yes(input), "for input {input:?}");
+        }
     }
 }
