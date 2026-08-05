@@ -181,6 +181,7 @@ pub mod strategies {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ExchangeId, Interval, Symbol};
     use std::str::FromStr;
 
     #[test]
@@ -192,5 +193,79 @@ mod tests {
             sma.update(Decimal::from_str("3").expect("decimal")),
             Some(Decimal::from_str("2").expect("decimal"))
         );
+    }
+
+    #[derive(Debug)]
+    struct RecordingContext {
+        market: MarketId,
+        target: Option<TargetPosition>,
+    }
+
+    impl StrategyContext for RecordingContext {
+        fn market(&self) -> &MarketId {
+            &self.market
+        }
+
+        fn now_ms(&self) -> TimestampMs {
+            0
+        }
+
+        fn cash(&self) -> Decimal {
+            Decimal::ZERO
+        }
+
+        fn position_qty(&self) -> Decimal {
+            Decimal::ZERO
+        }
+
+        fn set_target_position(&mut self, target: TargetPosition) {
+            self.target = Some(target);
+        }
+    }
+
+    fn candle(open_time_ms: TimestampMs, close: &str) -> Candle {
+        let close = Decimal::from_str(close).expect("decimal");
+        Candle {
+            open_time_ms,
+            close_time_ms: open_time_ms + 59_999,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: Decimal::ONE,
+            trades: Some(1),
+        }
+    }
+
+    // The cross comparisons are strictly greater/less on purpose: equal
+    // averages must emit nothing, so a holder keeps its position and a flat
+    // run stays flat. The live-engine execution tests lean on this.
+    #[test]
+    fn sma_cross_emits_no_signal_when_fast_equals_slow() {
+        let mut strategy = strategies::SmaCrossStrategy::new(1, 2).expect("strategy");
+        let mut ctx = RecordingContext {
+            market: MarketId::new(
+                ExchangeId::BinanceSpot,
+                Symbol::new("BTCUSDT").expect("symbol"),
+                Interval::M1,
+            ),
+            target: None,
+        };
+
+        // Slow window still warming: no signal possible.
+        strategy.on_bar(&mut ctx, &candle(0, "100")).expect("bar");
+        assert_eq!(ctx.target, None);
+
+        // Fast == slow == 100: strictly-greater/less comparisons stay silent.
+        strategy
+            .on_bar(&mut ctx, &candle(60_000, "100"))
+            .expect("bar");
+        assert_eq!(ctx.target, None);
+
+        // A rising close crosses fast above slow and finally signals.
+        strategy
+            .on_bar(&mut ctx, &candle(120_000, "101"))
+            .expect("bar");
+        assert_eq!(ctx.target, Some(TargetPosition::LongAllIn));
     }
 }
