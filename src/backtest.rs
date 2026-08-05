@@ -267,7 +267,7 @@ impl StrategyContext for EngineContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExchangeId, Interval, Symbol};
+    use crate::{BuiltInStrategyConfig, ExchangeId, Interval, Symbol, validate_candles};
     use std::str::FromStr;
 
     #[derive(Debug)]
@@ -313,6 +313,66 @@ mod tests {
             volume: Decimal::ONE,
             trades: Some(1),
         }
+    }
+
+    fn dec(value: &str) -> Decimal {
+        Decimal::from_str(value).expect("decimal")
+    }
+
+    fn ohlc_candle(index: i64, open: &str, close: &str) -> Candle {
+        let open = dec(open);
+        let close = dec(close);
+        let open_time_ms = index * 60_000;
+        Candle {
+            open_time_ms,
+            close_time_ms: open_time_ms + 59_999,
+            open,
+            high: open.max(close),
+            low: open.min(close),
+            close,
+            volume: Decimal::ONE,
+            trades: Some(1),
+        }
+    }
+
+    // Regression fixture for the full SMA-cross pipeline (fast=2, slow=3,
+    // cash=10010, fee=10 bps). Prices are chosen so every division behind the
+    // pinned values is exact in `Decimal` and each entry spends cash to
+    // exactly zero, keeping the pinned trades, equity, return, and drawdown
+    // hand-verifiable (the few rounded divisions only feed comparisons whose
+    // outcome is unambiguous):
+    // - closes rise: fast crosses above slow on bar 2, buy fills at bar 3
+    //   open 100 (10010 / (100 * 1.001) = qty 100), equity peaks at 11000 on
+    //   bar 5, then closes fall to 9900 on bar 7 (the 10% max drawdown) where
+    //   fast drops below slow;
+    // - the sell fills at bar 8 open 100.1 (cash 100 * 100.1 * 0.999 =
+    //   9999.99, a fee-driven losing trade);
+    // - bar 10 has fast == slow, which must produce no signal;
+    // - fast crosses back above slow on bar 11, the buy fills at bar 12 open
+    //   99.9 (9999.99 / (99.9 * 1.001) = qty 100), and the run ends long, so
+    //   close-out sells at the last close 110.11 (cash 10999.989).
+    fn sma_cross_fixture() -> Vec<Candle> {
+        [
+            ("96", "97"),
+            ("97", "99"),
+            ("99", "101"),
+            ("100", "103"),
+            ("103", "105"),
+            ("105", "110"),
+            ("110", "103"),
+            ("103", "99"),
+            ("100.1", "98"),
+            ("98", "97"),
+            ("97", "99"),
+            ("99", "101"),
+            ("99.9", "103"),
+            ("103", "105"),
+            ("105", "110.11"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, (open, close))| ohlc_candle(index as i64, open, close))
+        .collect()
     }
 
     #[test]
@@ -386,5 +446,68 @@ mod tests {
                 .to_string()
                 .contains("fee_bps must be zero or greater")
         );
+    }
+
+    #[test]
+    fn backtest_sma_cross_on_fixed_fixture_reproduces_pinned_result() {
+        let market = market();
+        let candles = sma_cross_fixture();
+        let report = validate_candles(&market, &candles);
+        assert!(
+            report.is_ok(),
+            "fixture must stay a valid candle series: {:?}",
+            report.issues
+        );
+
+        let run = || {
+            let mut strategy = BuiltInStrategyConfig::SmaCross { fast: 2, slow: 3 }
+                .build()
+                .expect("strategy");
+            BacktestEngine::new(BacktestConfig {
+                initial_cash: dec("10010"),
+                fee_bps: dec("10"),
+                close_out_at_end: true,
+            })
+            .run(&market, &candles, strategy.as_mut())
+            .expect("backtest")
+        };
+
+        let result = run();
+        let expected = BacktestResult {
+            initial_cash: dec("10010"),
+            final_equity: dec("10999.989"),
+            total_return_pct: dec("9.89"),
+            trade_count: 2,
+            max_drawdown_pct: dec("10"),
+            trades: vec![
+                ClosedTrade {
+                    symbol: Symbol::new("BTCUSDT").expect("symbol"),
+                    entry_time_ms: 180_000,
+                    exit_time_ms: 480_000,
+                    entry_price: dec("100"),
+                    exit_price: dec("100.1"),
+                    qty: dec("100"),
+                    gross_quote_pnl: dec("-10.01"),
+                    entry_order_id: None,
+                    exit_order_id: None,
+                },
+                ClosedTrade {
+                    symbol: Symbol::new("BTCUSDT").expect("symbol"),
+                    entry_time_ms: 720_000,
+                    exit_time_ms: 899_999,
+                    entry_price: dec("99.9"),
+                    exit_price: dec("110.11"),
+                    qty: dec("100"),
+                    gross_quote_pnl: dec("999.999"),
+                    entry_order_id: None,
+                    exit_order_id: None,
+                },
+            ],
+        };
+        assert_eq!(result, expected);
+
+        // A fresh strategy over the same fixture must reproduce the result
+        // bit for bit: the backtest is a pure function of its inputs.
+        assert_eq!(run(), result);
     }
 }

@@ -390,3 +390,98 @@ fn data_validate_rejects_invalid_interval_with_clear_error() {
         .failure()
         .stderr(predicate::str::contains("invalid interval: 7m"));
 }
+
+#[test]
+fn backtest_reproduces_pinned_summary_for_seeded_fixture() {
+    let tempdir = tempdir().expect("tempdir");
+    let db_path = tempdir.path().join("market.sqlite");
+
+    let store = SqliteStore::new(&db_path);
+    CandleStore::init(&store).expect("init store");
+    let market = MarketId::new(
+        ExchangeId::BinanceSpot,
+        Symbol::new("BTCUSDT").expect("symbol"),
+        Interval::M1,
+    );
+    // Same regression fixture as the engine-level test in `src/backtest.rs`
+    // (see `sma_cross_fixture` there for the design notes): with fast=2,
+    // slow=3, cash=10010, and fee 10 bps, every division behind the pinned
+    // output is exact in `Decimal`, producing one fee-driven losing trade,
+    // one winning trade closed out at the end, and a 10% max drawdown.
+    let candles: Vec<Candle> = [
+        ("96", "97"),
+        ("97", "99"),
+        ("99", "101"),
+        ("100", "103"),
+        ("103", "105"),
+        ("105", "110"),
+        ("110", "103"),
+        ("103", "99"),
+        ("100.1", "98"),
+        ("98", "97"),
+        ("97", "99"),
+        ("99", "101"),
+        ("99.9", "103"),
+        ("103", "105"),
+        ("105", "110.11"),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, (open, close))| {
+        let open: Decimal = open.parse().expect("decimal");
+        let close: Decimal = close.parse().expect("decimal");
+        let open_time_ms = index as i64 * 60_000;
+        Candle {
+            open_time_ms,
+            close_time_ms: open_time_ms + 59_999,
+            open,
+            high: open.max(close),
+            low: open.min(close),
+            close,
+            volume: Decimal::ONE,
+            trades: Some(1),
+        }
+    })
+    .collect();
+    store
+        .upsert_candles(&market, &candles)
+        .expect("seed candles");
+
+    let mut cmd = Command::cargo_bin("quantforge").expect("binary");
+    cmd.env_remove("QF_BINANCE_BASE_URL")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--log-level")
+        .arg("error")
+        .args([
+            "backtest",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "1m",
+            "--fast",
+            "2",
+            "--slow",
+            "3",
+            "--cash",
+            "10010",
+            "--fee-bps",
+            "10",
+        ]);
+    // Full lines pinned verbatim, newline-anchored: the summary decimals'
+    // trailing zeros are deterministic `Decimal` scale propagation and part
+    // of the stdout contract.
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("strategy: sma_cross\n"))
+        .stdout(predicate::str::contains("final_equity: 10999.98900\n"))
+        .stdout(predicate::str::contains("total_return_pct: 9.89000\n"))
+        .stdout(predicate::str::contains("max_drawdown_pct: 10.00\n"))
+        .stdout(predicate::str::contains("trade_count: 2\n"))
+        .stdout(predicate::str::contains(
+            "trade: entry=180000 @ 100 exit=480000 @ 100.1 qty=100 gross_pnl=-10.0100\n",
+        ))
+        .stdout(predicate::str::contains(
+            "trade: entry=720000 @ 99.9 exit=899999 @ 110.11 qty=100 gross_pnl=999.99900\n",
+        ));
+}
