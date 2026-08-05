@@ -24,6 +24,8 @@ All notable changes to this project will be documented in this file.
 - backtests reject non-positive initial cash and negative fees at the engine level; the live bootstrap window uses checked arithmetic
 - `trade run --mode live` requires explicit confirmation: an interactive `yes` prompt on a terminal, or `--yes` for unattended runs; non-interactive runs without `--yes` print a preview of the would-be live run and exit without trading
 - live-mode confirmations and logs mark production Binance endpoints with `(PRODUCTION)` and a confirmed live run against one logs a warning, replacing the previous default-URL-only startup warning; printed base URLs have userinfo removed
+- `data validate` flags non-positive `open`/`high`/`low`/`close` prices and negative volume; zero volume remains valid
+- candle gap detection no longer overflows on open times near the representable maximum; an unrepresentable expected open time is reported as a gap
 
 ### Removed
 
