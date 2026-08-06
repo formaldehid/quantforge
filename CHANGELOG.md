@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- codeql static analysis workflow running on pull requests targeting `main`, pushes to `main`, and a weekly schedule
+- gitleaks secret scanning workflow covering the full git history on the same triggers plus manual dispatch
+- ci, codeql, and gitleaks status badges in `README.md`
+
 ### Changed
 
 - ci runs on pull requests targeting `main` instead of on every push and pull request, removing duplicate workflow runs

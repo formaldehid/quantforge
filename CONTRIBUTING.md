@@ -38,3 +38,13 @@ Examples:
 ## Security and secrets
 
 Do not commit API keys, secrets, `.env` files, or production credentials.
+
+Every pull request is scanned for leaked secrets with gitleaks. To run the same
+scan locally over the committed history:
+
+```bash
+gitleaks git .
+```
+
+The `git` subcommand scans commits only, so untracked files such as your local
+`.env` are never read.

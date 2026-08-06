@@ -1,5 +1,9 @@
 # QuantForge
 
+[![ci](https://github.com/formaldehid/quantforge/actions/workflows/ci.yml/badge.svg)](https://github.com/formaldehid/quantforge/actions/workflows/ci.yml)
+[![codeql](https://github.com/formaldehid/quantforge/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/formaldehid/quantforge/actions/workflows/codeql.yml)
+[![gitleaks](https://github.com/formaldehid/quantforge/actions/workflows/gitleaks.yml/badge.svg?branch=main)](https://github.com/formaldehid/quantforge/actions/workflows/gitleaks.yml)
+
 QuantForge is a CLI-first trading systems framework in Rust for deterministic research,
 SQLite-backed market data, and controlled strategy execution.
 
