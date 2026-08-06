@@ -5,6 +5,11 @@ use thiserror::Error;
 
 use crate::model::{Candle, MarketId, TargetPosition, TimestampMs};
 
+/// Error reported by a strategy callback.
+///
+/// Deliberately a plain message string: a foreign strategy implementation
+/// (for example a Python strategy behind an FFI boundary) can produce it
+/// without constructing any Rust-only error type.
 #[derive(Error, Debug)]
 pub enum StrategyError {
     #[error("{0}")]
@@ -17,24 +22,86 @@ impl StrategyError {
     }
 }
 
-pub trait StrategyContext {
-    fn market(&self) -> &MarketId;
-    fn now_ms(&self) -> TimestampMs;
-    fn cash(&self) -> Decimal;
-    fn position_qty(&self) -> Decimal;
-    fn set_target_position(&mut self, target: TargetPosition);
+/// Plain-data snapshot of engine state passed to every [`Strategy`]
+/// callback.
+///
+/// Every field is an owned value: nothing borrows into engine internals,
+/// so a snapshot can be copied across an FFI boundary without lifetime
+/// coupling to the engine that produced it.
+///
+/// Field provenance differs by engine and is part of the contract:
+///
+/// - `now_ms` is the current bar's open time in backtests and its close
+///   time in live and dry runs (wall clock during `on_start` there)
+/// - `cash` is the simulated quote balance in backtests and always zero in
+///   live and dry runs, where order sizing comes from the configured
+///   `quote_order_qty` instead
+/// - `position_qty` is the engine's current base-asset position
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrategyContext {
+    pub market: MarketId,
+    pub now_ms: TimestampMs,
+    pub cash: Decimal,
+    pub position_qty: Decimal,
 }
 
+/// A trading strategy driven bar by bar by an engine.
+///
+/// # Boundary contract
+///
+/// The trait is deliberately FFI-friendly: object-safe, no generics, no
+/// lifetimes beyond transient borrows of owned data, input as a plain-data
+/// snapshot ([`StrategyContext`]), and both decisions
+/// (`Option<TargetPosition>`) and errors ([`StrategyError`], a message
+/// string) as plain data. A foreign implementation only consumes values
+/// and returns values; it never calls back into the engine.
+///
+/// ## Call order
+///
+/// 1. `on_start` — exactly once, before any bar
+/// 2. `on_bar` — once per closed candle, in ascending open-time order;
+///    engines never deliver a partial bar or the same bar twice
+/// 3. `on_finish` — exactly once after the final bar, but not when an
+///    earlier callback returned an error
+///
+/// ## Decision semantics
+///
+/// `on_bar` returns the desired position after this bar: `Some(target)`
+/// requests it, `None` leaves the current position untouched. Requesting
+/// the already-held target is a no-op. Backtests fill a request at the
+/// next bar's open; live and dry runs execute against the signal bar's
+/// close.
+///
+/// ## Error semantics
+///
+/// Returning `Err` from any callback aborts the run: engines stop
+/// delivering bars, mark the run failed, and surface the message to the
+/// operator.
+///
+/// ## Determinism
+///
+/// Implementations must be pure functions of the observed bar sequence and
+/// their own accumulated state: no clocks, randomness, or I/O. The engines
+/// rely on this to keep backtests reproducible and to warm strategies up
+/// consistently when a live run restarts and replays recent bars.
 pub trait Strategy: Send {
-    fn name(&self) -> &'static str;
+    /// Stable identifier recorded in run journals and operator output.
+    ///
+    /// Borrowed from `self` rather than `'static` so foreign strategies
+    /// can report dynamically owned names.
+    fn name(&self) -> &str;
 
-    fn on_start(&mut self, _ctx: &mut dyn StrategyContext) -> Result<(), StrategyError> {
+    fn on_start(&mut self, _ctx: &StrategyContext) -> Result<(), StrategyError> {
         Ok(())
     }
 
-    fn on_bar(&mut self, ctx: &mut dyn StrategyContext, bar: &Candle) -> Result<(), StrategyError>;
+    fn on_bar(
+        &mut self,
+        ctx: &StrategyContext,
+        bar: &Candle,
+    ) -> Result<Option<TargetPosition>, StrategyError>;
 
-    fn on_finish(&mut self, _ctx: &mut dyn StrategyContext) -> Result<(), StrategyError> {
+    fn on_finish(&mut self, _ctx: &StrategyContext) -> Result<(), StrategyError> {
         Ok(())
     }
 }
@@ -150,30 +217,31 @@ pub mod strategies {
     }
 
     impl Strategy for SmaCrossStrategy {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "sma_cross"
         }
 
         fn on_bar(
             &mut self,
-            ctx: &mut dyn StrategyContext,
+            _ctx: &StrategyContext,
             bar: &Candle,
-        ) -> Result<(), StrategyError> {
+        ) -> Result<Option<TargetPosition>, StrategyError> {
             let fast_now = self.fast.update(bar.close);
             let slow_now = self.slow.update(bar.close);
 
             if let (Some(fast_now), Some(slow_now)) = (fast_now, slow_now) {
-                if fast_now > slow_now {
-                    ctx.set_target_position(TargetPosition::LongAllIn);
-                } else if fast_now < slow_now {
-                    ctx.set_target_position(TargetPosition::Flat);
-                }
-
                 self.prev_fast = Some(fast_now);
                 self.prev_slow = Some(slow_now);
+
+                if fast_now > slow_now {
+                    return Ok(Some(TargetPosition::LongAllIn));
+                }
+                if fast_now < slow_now {
+                    return Ok(Some(TargetPosition::Flat));
+                }
             }
 
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -195,31 +263,16 @@ mod tests {
         );
     }
 
-    #[derive(Debug)]
-    struct RecordingContext {
-        market: MarketId,
-        target: Option<TargetPosition>,
-    }
-
-    impl StrategyContext for RecordingContext {
-        fn market(&self) -> &MarketId {
-            &self.market
-        }
-
-        fn now_ms(&self) -> TimestampMs {
-            0
-        }
-
-        fn cash(&self) -> Decimal {
-            Decimal::ZERO
-        }
-
-        fn position_qty(&self) -> Decimal {
-            Decimal::ZERO
-        }
-
-        fn set_target_position(&mut self, target: TargetPosition) {
-            self.target = Some(target);
+    fn context() -> StrategyContext {
+        StrategyContext {
+            market: MarketId::new(
+                ExchangeId::BinanceSpot,
+                Symbol::new("BTCUSDT").expect("symbol"),
+                Interval::M1,
+            ),
+            now_ms: 0,
+            cash: Decimal::ZERO,
+            position_qty: Decimal::ZERO,
         }
     }
 
@@ -243,29 +296,21 @@ mod tests {
     #[test]
     fn sma_cross_emits_no_signal_when_fast_equals_slow() {
         let mut strategy = strategies::SmaCrossStrategy::new(1, 2).expect("strategy");
-        let mut ctx = RecordingContext {
-            market: MarketId::new(
-                ExchangeId::BinanceSpot,
-                Symbol::new("BTCUSDT").expect("symbol"),
-                Interval::M1,
-            ),
-            target: None,
-        };
+        let ctx = context();
 
         // Slow window still warming: no signal possible.
-        strategy.on_bar(&mut ctx, &candle(0, "100")).expect("bar");
-        assert_eq!(ctx.target, None);
+        assert_eq!(strategy.on_bar(&ctx, &candle(0, "100")).expect("bar"), None);
 
         // Fast == slow == 100: strictly-greater/less comparisons stay silent.
-        strategy
-            .on_bar(&mut ctx, &candle(60_000, "100"))
-            .expect("bar");
-        assert_eq!(ctx.target, None);
+        assert_eq!(
+            strategy.on_bar(&ctx, &candle(60_000, "100")).expect("bar"),
+            None
+        );
 
         // A rising close crosses fast above slow and finally signals.
-        strategy
-            .on_bar(&mut ctx, &candle(120_000, "101"))
-            .expect("bar");
-        assert_eq!(ctx.target, Some(TargetPosition::LongAllIn));
+        assert_eq!(
+            strategy.on_bar(&ctx, &candle(120_000, "101")).expect("bar"),
+            Some(TargetPosition::LongAllIn)
+        );
     }
 }

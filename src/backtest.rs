@@ -64,15 +64,14 @@ impl BacktestEngine {
         let mut peak_equity = Decimal::ZERO;
         let mut max_drawdown = Decimal::ZERO;
 
-        let mut ctx = EngineContext {
+        let mut ctx = StrategyContext {
             market: market.clone(),
             now_ms: candles[0].open_time_ms,
             cash,
             position_qty: qty,
-            desired_target: None,
         };
 
-        strategy.on_start(&mut ctx)?;
+        strategy.on_start(&ctx)?;
 
         for (index, candle) in candles.iter().enumerate() {
             ctx.now_ms = candle.open_time_ms;
@@ -95,7 +94,6 @@ impl BacktestEngine {
 
             ctx.cash = cash;
             ctx.position_qty = qty;
-            ctx.desired_target = None;
 
             let equity = cash + qty * candle.close;
             if equity > peak_equity {
@@ -108,8 +106,7 @@ impl BacktestEngine {
                 }
             }
 
-            strategy.on_bar(&mut ctx, candle)?;
-            pending_target = ctx.desired_target;
+            pending_target = strategy.on_bar(&ctx, candle)?;
         }
 
         if self.cfg.close_out_at_end && qty > Decimal::ZERO {
@@ -130,7 +127,7 @@ impl BacktestEngine {
 
         ctx.cash = cash;
         ctx.position_qty = qty;
-        strategy.on_finish(&mut ctx)?;
+        strategy.on_finish(&ctx)?;
 
         let last_close = candles
             .last()
@@ -233,37 +230,6 @@ fn execute_target(
     }
 }
 
-#[derive(Debug)]
-struct EngineContext {
-    market: MarketId,
-    now_ms: TimestampMs,
-    cash: Decimal,
-    position_qty: Decimal,
-    desired_target: Option<TargetPosition>,
-}
-
-impl StrategyContext for EngineContext {
-    fn market(&self) -> &MarketId {
-        &self.market
-    }
-
-    fn now_ms(&self) -> TimestampMs {
-        self.now_ms
-    }
-
-    fn cash(&self) -> Decimal {
-        self.cash
-    }
-
-    fn position_qty(&self) -> Decimal {
-        self.position_qty
-    }
-
-    fn set_target_position(&mut self, target: TargetPosition) {
-        self.desired_target = Some(target);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,21 +242,20 @@ mod tests {
     }
 
     impl Strategy for ScriptedStrategy {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "scripted"
         }
 
         fn on_bar(
             &mut self,
-            ctx: &mut dyn StrategyContext,
+            _ctx: &StrategyContext,
             bar: &Candle,
-        ) -> Result<(), crate::StrategyError> {
-            for (ts, target) in &self.targets {
-                if *ts == bar.open_time_ms {
-                    ctx.set_target_position(*target);
-                }
-            }
-            Ok(())
+        ) -> Result<Option<TargetPosition>, crate::StrategyError> {
+            Ok(self
+                .targets
+                .iter()
+                .find(|(ts, _)| *ts == bar.open_time_ms)
+                .map(|(_, target)| *target))
         }
     }
 

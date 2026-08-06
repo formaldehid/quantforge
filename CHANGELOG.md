@@ -12,6 +12,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- `Strategy::on_bar` returns the desired target position as plain data instead of mutating a context callback, making the strategy boundary drivable across an FFI boundary
+- `StrategyContext` is now a plain-data snapshot struct with owned `market`, `now_ms`, `cash`, and `position_qty` fields instead of a trait
+- `Strategy::name` returns `&str` instead of `&'static str` so foreign strategies can report dynamically owned names
 - ci runs on pull requests targeting `main` instead of on every push and pull request, removing duplicate workflow runs
 - superseded ci runs for the same pull request are cancelled automatically
 - `data validate` exits non-zero when validation issues are found
