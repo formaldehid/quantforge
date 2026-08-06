@@ -1,0 +1,34 @@
+name: gitleaks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "19 6 * * 4"
+  workflow_dispatch:
+
+# event name is part of the group so a push-scoped scan cannot cancel an
+# in-flight weekly full-history sweep on the same ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # allows the action to comment on the offending lines of a pull request
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # full history so every commit is scanned, not just the checked-out tree
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          # GITLEAKS_LICENSE is only required for organization-owned repos;
+          # this repo belongs to a personal account
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

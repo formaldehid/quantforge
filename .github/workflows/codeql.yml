@@ -1,0 +1,38 @@
+name: codeql
+
+# unlike ci, this workflow also runs on push to main: code scanning compares
+# pull request analyses against a default-branch baseline, so main must be
+# analyzed too, not only pull requests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "37 5 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      # upload code scanning results
+      security-events: write
+      # only needed for private packs and private repositories; kept to
+      # match the upstream starter workflow
+      packages: read
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          # analysis without compiling; avoids building rusqlite's bundled sqlite
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:rust"

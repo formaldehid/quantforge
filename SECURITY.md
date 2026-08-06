@@ -14,3 +14,13 @@ Do not open a public issue for:
 - secret management flaws
 - supply-chain security concerns that are not yet patched
 - vulnerabilities that could put exchange credentials or user data at risk
+
+## Automated Security Checks
+
+Three layers of automated scanning run on this repository:
+
+- **CodeQL** static analysis runs on pull requests targeting `main`, on pushes to `main`, and weekly; alerts appear in the repository Security tab under Code scanning
+- **gitleaks** scans the full git history for committed secrets on pull requests targeting `main`, on pushes to `main`, and weekly
+- **GitHub secret scanning with push protection** runs server-side and blocks pushes containing known credential patterns
+
+If a credential does leak, rotate it first — rewriting git history does not revoke a secret. Then report the incident privately as described above.
