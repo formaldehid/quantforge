@@ -35,6 +35,15 @@ Examples:
 - `fix(storage): commit sqlite transaction after statement drop`
 - `docs(readme): clarify determinism contract`
 
+## Running the e2e tiers
+
+Plain `cargo test` runs the offline tier (mock exchange, zero network).
+Testnet-tier tests run only when `QF_BINANCE_API_KEY` and
+`QF_BINANCE_API_SECRET` (Binance Spot *testnet* keys) are exported;
+otherwise they skip with a `SKIP (testnet tier)` marker on stderr. Run one
+tier alone with `cargo test --test e2e offline::` or
+`cargo test --test e2e testnet::`.
+
 ## Security and secrets
 
 Do not commit API keys, secrets, `.env` files, or production credentials.
