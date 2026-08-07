@@ -2,7 +2,7 @@ use crate::{
     BotRunState, BuiltInStrategyConfig, Candle, CandleQuery, CandleStore, ClosedTrade,
     ExchangeOrder, ExecutionMode, MarketDataSource, MarketId, MarketOrderRequest, PositionState,
     RunJournalStore, RunStatus, Side, Strategy, StrategyContext, SymbolRules, TargetPosition,
-    TimestampMs, TradingVenue, now_utc_ms, round_down_to_step,
+    TradingVenue, now_utc_ms, round_down_to_step,
 };
 use crate::{
     EngineError,
@@ -188,8 +188,17 @@ impl<'a> LiveTradeEngine<'a> {
             .await?;
         }
 
-        let mut ctx = LiveStrategyContext::new(cfg.market.clone(), run_state.position.qty);
-        strategy.on_start(&mut ctx)?;
+        let mut ctx = StrategyContext {
+            market: cfg.market.clone(),
+            now_ms: now_utc_ms(),
+            // Live trading does not track quote-asset cash: `ctx.cash` is
+            // always zero here, while the backtest context reports real cash.
+            // Cash-based position sizing is a backtest-only feature today;
+            // live sizing comes from `LiveTradeConfig::quote_order_qty`.
+            cash: Decimal::ZERO,
+            position_qty: run_state.position.qty,
+        };
+        strategy.on_start(&ctx)?;
 
         let bootstrap_candles = self
             .candle_store
@@ -200,9 +209,7 @@ impl<'a> LiveTradeEngine<'a> {
         for candle in &closed_bootstrap {
             ctx.now_ms = candle.close_time_ms;
             ctx.position_qty = run_state.position.qty;
-            ctx.desired_target = None;
-            strategy.on_bar(&mut ctx, candle)?;
-            if let Some(target) = ctx.desired_target {
+            if let Some(target) = strategy.on_bar(&ctx, candle)? {
                 last_bootstrap_target = target;
             }
         }
@@ -271,11 +278,9 @@ impl<'a> LiveTradeEngine<'a> {
 
                 ctx.now_ms = candle.close_time_ms;
                 ctx.position_qty = run_state.position.qty;
-                ctx.desired_target = None;
 
-                strategy.on_bar(&mut ctx, &candle)?;
-                let desired = ctx
-                    .desired_target
+                let desired = strategy
+                    .on_bar(&ctx, &candle)?
                     .unwrap_or_else(|| current_target(&run_state.position));
 
                 if desired != current_target(&run_state.position) {
@@ -300,7 +305,7 @@ impl<'a> LiveTradeEngine<'a> {
             }
         }
 
-        strategy.on_finish(&mut ctx)?;
+        strategy.on_finish(&ctx)?;
         Ok(())
     }
 
@@ -760,59 +765,13 @@ fn new_client_order_id(tag: &str, run_id: &str) -> String {
     id
 }
 
-#[derive(Debug)]
-struct LiveStrategyContext {
-    market: MarketId,
-    now_ms: TimestampMs,
-    cash: Decimal,
-    position_qty: Decimal,
-    desired_target: Option<TargetPosition>,
-}
-
-impl LiveStrategyContext {
-    fn new(market: MarketId, position_qty: Decimal) -> Self {
-        Self {
-            market,
-            now_ms: now_utc_ms(),
-            // Live trading does not track quote-asset cash: `ctx.cash()` is
-            // always zero here, while the backtest context reports real cash.
-            // Cash-based position sizing is a backtest-only feature today;
-            // live sizing comes from `LiveTradeConfig::quote_order_qty`.
-            cash: Decimal::ZERO,
-            position_qty,
-            desired_target: None,
-        }
-    }
-}
-
-impl StrategyContext for LiveStrategyContext {
-    fn market(&self) -> &MarketId {
-        &self.market
-    }
-
-    fn now_ms(&self) -> TimestampMs {
-        self.now_ms
-    }
-
-    fn cash(&self) -> Decimal {
-        self.cash
-    }
-
-    fn position_qty(&self) -> Decimal {
-        self.position_qty
-    }
-
-    fn set_target_position(&mut self, target: TargetPosition) {
-        self.desired_target = Some(target);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         AccountTrade, AssetBalance, CancelOrderRequest, ExchangeError, ExchangeId, Interval,
         KlineRequest, OrderQueryRequest, OrderStatus, SqliteStore, StorageError, Symbol,
+        TimestampMs,
     };
     use std::collections::VecDeque;
     use std::str::FromStr;
