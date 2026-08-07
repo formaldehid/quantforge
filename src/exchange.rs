@@ -496,7 +496,12 @@ fn parse_optional_filter_decimal(
     field: &str,
 ) -> Result<Option<Decimal>, ExchangeError> {
     match filter.get(field).and_then(Value::as_str) {
-        Some(raw) => Ok(Some(parse_decimal(raw, field)?)),
+        // Binance renders "no constraint" as "0.00000000" (observed on the
+        // Spot testnet's MARKET_LOT_SIZE). A non-positive limit is an
+        // absent rule, not a zero-step rule: keeping the zero would make
+        // `effective_market_step_size` skip the LOT_SIZE fallback and feed
+        // `round_down_to_step` a step it asserts against.
+        Some(raw) => Ok(Some(parse_decimal(raw, field)?).filter(|value| *value > Decimal::ZERO)),
         None => Ok(None),
     }
 }
@@ -812,6 +817,39 @@ mod tests {
         assert_eq!(
             rules.effective_market_min_qty(),
             Some(Decimal::from_str_exact("0.001").expect("decimal"))
+        );
+    }
+
+    // The Spot testnet renders MARKET_LOT_SIZE's "no constraint" limits as
+    // "0.00000000": zero-valued limits must read as absent so the
+    // effective_* helpers fall back to LOT_SIZE instead of handing a zero
+    // step to quantity rounding.
+    #[test]
+    fn zero_valued_filter_limits_are_treated_as_absent() {
+        let info = BinanceSymbolInfo {
+            symbol: "BTCUSDT".to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            filters: vec![
+                serde_json::json!({"filterType": "LOT_SIZE", "minQty": "0.00001000", "maxQty": "9000.00000000", "stepSize": "0.00001000"}),
+                serde_json::json!({"filterType": "MARKET_LOT_SIZE", "minQty": "0.00000000", "maxQty": "141.67845966", "stepSize": "0.00000000"}),
+            ],
+        };
+
+        let rules = parse_symbol_rules(info).expect("rules");
+        assert_eq!(rules.market_min_qty, None);
+        assert_eq!(rules.market_step_size, None);
+        assert_eq!(
+            rules.market_max_qty,
+            Some(Decimal::from_str_exact("141.67845966").expect("decimal"))
+        );
+        assert_eq!(
+            rules.effective_market_step_size(),
+            Some(Decimal::from_str_exact("0.00001000").expect("decimal"))
+        );
+        assert_eq!(
+            rules.effective_market_min_qty(),
+            Some(Decimal::from_str_exact("0.00001000").expect("decimal"))
         );
     }
 

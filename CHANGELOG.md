@@ -45,6 +45,7 @@ All notable changes to this project will be documented in this file.
 - `Interval::H8` now formats as `8h` instead of `1m`
 - re-sync any 8h candles written before this fix; they were stored under the `1m` interval key
 - `Symbol` deserialization now validates and normalizes (trim, uppercase, reject empty) exactly like `Symbol::new`, closing the bypass on `state_json`/`raw_json` reloads
+- zero-valued exchange filter limits (Binance renders "no constraint" as `0.00000000`, as its testnet does for `MARKET_LOT_SIZE`) are treated as absent rules, so quantity rounding falls back to `LOT_SIZE` instead of receiving a zero step
 
 ## [0.2.0] - 2026-03-21
 
