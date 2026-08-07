@@ -2,6 +2,7 @@
 //! Temporary home until the per-command split (`cli/data`, `cli/trade`, ...).
 
 use super::CliExecutionMode;
+use super::context::{self, AppContext};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use quantforge::SqliteStore;
@@ -16,7 +17,7 @@ use quantforge::{
     validate_candles,
 };
 use rust_decimal::Decimal;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::time::Duration;
 use tracing::warn;
 use url::Url;
@@ -232,19 +233,13 @@ pub(crate) fn display_url(url: &Url) -> Url {
     redacted
 }
 
-fn confirmation_is_yes(input: &str) -> bool {
-    input.trim().eq_ignore_ascii_case("yes")
-}
-
 fn strategy_config(fast: usize, slow: usize) -> BuiltInStrategyConfig {
     BuiltInStrategyConfig::SmaCross { fast, slow }
 }
 
-pub(crate) async fn handle_data_sync(
-    store: &SqliteStore,
-    client: &BinanceSpotClient,
-    args: DataSyncArgs,
-) -> Result<()> {
+pub(crate) async fn handle_data_sync(ctx: &AppContext, args: DataSyncArgs) -> Result<()> {
+    let store = &ctx.store;
+    let client = &ctx.public_client;
     let market = parse_market(args.symbol, args.interval)?;
     let engine = DataSyncEngine::new(client, store);
     let summary = engine
@@ -288,7 +283,8 @@ pub(crate) async fn handle_data_sync(
     Ok(())
 }
 
-pub(crate) fn handle_data_validate(store: &SqliteStore, args: DataValidateArgs) -> Result<()> {
+pub(crate) fn handle_data_validate(ctx: &AppContext, args: DataValidateArgs) -> Result<()> {
+    let store = &ctx.store;
     let market = parse_market(args.symbol, args.interval)?;
     let candles = store.load_candles(
         &market,
@@ -328,7 +324,8 @@ pub(crate) fn handle_data_validate(store: &SqliteStore, args: DataValidateArgs) 
     Ok(())
 }
 
-pub(crate) fn handle_backtest(store: &SqliteStore, args: BacktestArgs) -> Result<()> {
+pub(crate) fn handle_backtest(ctx: &AppContext, args: BacktestArgs) -> Result<()> {
+    let store = &ctx.store;
     let market = parse_market(args.symbol, args.interval)?;
     let initial_cash = parse_positive_decimal("--cash", &args.cash)?;
     let fee_bps = parse_non_negative_decimal("--fee-bps", &args.fee_bps)?;
@@ -380,13 +377,11 @@ pub(crate) fn handle_backtest(store: &SqliteStore, args: BacktestArgs) -> Result
     Ok(())
 }
 
-pub(crate) async fn handle_trade_run(
-    store: &SqliteStore,
-    public_client: &BinanceSpotClient,
-    private_client: Option<&BinanceSpotClient>,
-    base_url: &Url,
-    args: TradeRunArgs,
-) -> Result<()> {
+pub(crate) async fn handle_trade_run(ctx: &AppContext, args: TradeRunArgs) -> Result<()> {
+    let store = &ctx.store;
+    let public_client = &ctx.public_client;
+    let private_client = ctx.private_client.as_ref();
+    let base_url = &ctx.base_url;
     let market = parse_market(args.symbol, args.interval)?;
     let quote_order_qty = parse_positive_decimal("--quote-order-qty", &args.quote_order_qty)?;
 
@@ -421,15 +416,7 @@ pub(crate) async fn handle_trade_run(
             if args.bootstrap_enter {
                 println!("note: --bootstrap-enter may place an order on the first loop");
             }
-            print!("type 'yes' to confirm, anything else aborts: ");
-            io::stdout()
-                .flush()
-                .context("failed to flush confirmation prompt")?;
-            let mut input = String::new();
-            io::stdin()
-                .read_line(&mut input)
-                .context("failed to read live-trading confirmation")?;
-            if !confirmation_is_yes(&input) {
+            if !context::prompt_confirmation("type 'yes' to confirm, anything else aborts: ")? {
                 println!("aborted; no orders sent");
                 return Ok(());
             }
@@ -486,11 +473,13 @@ pub(crate) async fn handle_trade_run(
     Ok(())
 }
 
-pub(crate) async fn handle_trade_close(
-    store: &SqliteStore,
-    private_client: &BinanceSpotClient,
-    args: TradeCloseArgs,
-) -> Result<()> {
+pub(crate) async fn handle_trade_close(ctx: &AppContext, args: TradeCloseArgs) -> Result<()> {
+    let store = &ctx.store;
+    // Credential gate before parsing, preserving the ordering the dispatch
+    // in main.rs used before the context extraction.
+    let private_client = ctx.require_private_client(
+        "trade close requires QF_BINANCE_API_KEY and QF_BINANCE_API_SECRET",
+    )?;
     let market = parse_market(args.symbol, args.interval)?;
     let rules = private_client.fetch_symbol_rules(&market.symbol).await?;
     let mut run_state = if let Some(run_id) = args.run_id {
@@ -981,15 +970,5 @@ mod tests {
     fn display_url_strips_userinfo() {
         let url = Url::parse("https://user:secret@api.binance.com/").expect("url");
         assert_eq!(display_url(&url).as_str(), "https://api.binance.com/");
-    }
-
-    #[test]
-    fn live_confirmation_accepts_only_yes() {
-        for input in ["yes", "YES", " yes \n", "Yes"] {
-            assert!(confirmation_is_yes(input), "for input {input:?}");
-        }
-        for input in ["", "y", "no", "live", "yes please"] {
-            assert!(!confirmation_is_yes(input), "for input {input:?}");
-        }
     }
 }

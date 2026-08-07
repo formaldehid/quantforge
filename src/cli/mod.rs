@@ -6,9 +6,12 @@ use quantforge::ExecutionMode;
 use std::path::PathBuf;
 
 mod commands;
+mod context;
 
-// Args types are only named by the Command enum below; the handlers and
-// display_url are what main.rs dispatches to.
+pub(crate) use context::AppContext;
+
+// Args types are only named by the Command enum below; the handlers are
+// what main.rs dispatches to, and display_url is shared with context.rs.
 use commands::{
     BacktestArgs, DataSyncArgs, DataValidateArgs, MonitorCancelOrderArgs, MonitorClosePositionArgs,
     MonitorOrdersArgs, MonitorStatusArgs, MonitorTradesArgs, MonitorWatchArgs, TradeCloseArgs,
