@@ -1,20 +1,20 @@
-//! Fully offline e2e tests against the scriptable mock Binance server in
-//! `tests/common/mod.rs`: every command here talks HTTP to a local
-//! ephemeral-port server with canned testnet-shaped payloads — zero real
-//! network, fake credentials, deterministic outcomes.
+//! Offline tier: every command talks HTTP to the local scriptable mock
+//! Binance server ([`crate::mock_binance`]) with canned testnet-shaped
+//! payloads — zero real network, fake credentials, deterministic outcomes.
+//! Always runs.
 
-mod common;
-
-use assert_cmd::Command;
-use common::{
+use crate::harness::{
+    CliOutput, FAKE_API_KEY, FAKE_API_SECRET, TestBed, cli_cmd, offline_cmd, offline_cmd_with_log,
+};
+use crate::mock_binance::{
     CannedResponse, MockBinance, Scenario, account_response, exchange_info_btcusdt, kline_row,
     my_trade_row, order_ack_response, order_full_response, order_query_response,
 };
+use assert_cmd::Command;
 use predicates::prelude::*;
-use quantforge::{RunJournalStore, RunStatus, SqliteStore};
+use quantforge::{RunJournalStore, RunStatus};
 use rust_decimal::Decimal;
 use std::str::FromStr;
-use tempfile::tempdir;
 
 // The engine reads the wall clock internally (bootstrap window, poll range,
 // closed-bar filter), so kline fixtures anchor to the current minute, far
@@ -28,47 +28,33 @@ fn anchor_ms() -> i64 {
     now_ms / 60_000 * 60_000 - 10 * 60_000
 }
 
-fn trade_run_live(
-    mock: &MockBinance,
-    db_path: &std::path::Path,
-    run_id: &str,
-    log_level: &str,
-) -> Command {
-    let mut cmd = Command::cargo_bin("quantforge").expect("binary");
-    cmd.env_remove("QF_BINANCE_BASE_URL")
-        .env("QF_BINANCE_API_KEY", "test-key")
-        .env("QF_BINANCE_API_SECRET", "test-secret")
-        .arg("--db")
-        .arg(db_path)
-        .arg("--log-level")
-        .arg(log_level)
-        .arg("--binance-base-url")
-        .arg(mock.base_url())
-        .args([
-            "trade",
-            "run",
-            "--symbol",
-            "BTCUSDT",
-            "--interval",
-            "1m",
-            "--mode",
-            "live",
-            "--yes",
-            "--fast",
-            "1",
-            "--slow",
-            "2",
-            "--bootstrap-bars",
-            "5",
-            "--poll-secs",
-            "1",
-            "--max-loops",
-            "2",
-            "--quote-order-qty",
-            "100",
-            "--run-id",
-            run_id,
-        ]);
+fn trade_run_live(mock: &MockBinance, bed: &TestBed, run_id: &str, log_level: &str) -> Command {
+    let mut cmd = offline_cmd_with_log(bed, mock, log_level);
+    cmd.args([
+        "trade",
+        "run",
+        "--symbol",
+        "BTCUSDT",
+        "--interval",
+        "1m",
+        "--mode",
+        "live",
+        "--yes",
+        "--fast",
+        "1",
+        "--slow",
+        "2",
+        "--bootstrap-bars",
+        "5",
+        "--poll-secs",
+        "1",
+        "--max-loops",
+        "2",
+        "--quote-order-qty",
+        "100",
+        "--run-id",
+        run_id,
+    ]);
     cmd
 }
 
@@ -120,10 +106,9 @@ fn live_trade_run_completes_an_entry_exit_round_trip_fully_offline() {
     ));
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    trade_run_live(&mock, &db_path, "e2e-live-1", "error")
+    trade_run_live(&mock, &bed, "e2e-live-1", "error")
         .assert()
         .success()
         .stdout(predicate::str::contains("run_id: e2e-live-1\n"))
@@ -133,7 +118,7 @@ fn live_trade_run_completes_an_entry_exit_round_trip_fully_offline() {
 
     // The journal agrees: run stopped flat with one closed trade at the
     // venue-reported prices.
-    let store = SqliteStore::new(&db_path);
+    let store = bed.store();
     let state = store
         .load_run_state("e2e-live-1")
         .expect("load run")
@@ -191,7 +176,7 @@ fn live_trade_run_completes_an_entry_exit_round_trip_fully_offline() {
     assert!(!entry.has_param_named("quantity"));
     assert!(entry.has_param_named("signature"));
     assert!(entry.has_param_named("timestamp"));
-    assert_eq!(entry.api_key.as_deref(), Some("test-key"));
+    assert_eq!(entry.api_key.as_deref(), Some(FAKE_API_KEY));
     let exit = orders[1];
     assert!(exit.has_param("side", "SELL"));
     assert!(
@@ -200,7 +185,7 @@ fn live_trade_run_completes_an_entry_exit_round_trip_fully_offline() {
         exit.query
     );
     assert!(!exit.has_param_named("quoteOrderQty"));
-    assert_eq!(exit.api_key.as_deref(), Some("test-key"));
+    assert_eq!(exit.api_key.as_deref(), Some(FAKE_API_KEY));
 
     let account: Vec<_> = requests
         .iter()
@@ -208,7 +193,7 @@ fn live_trade_run_completes_an_entry_exit_round_trip_fully_offline() {
         .collect();
     assert_eq!(account.len(), 1);
     assert!(account[0].has_param("omitZeroBalances", "true"));
-    assert_eq!(account[0].api_key.as_deref(), Some("test-key"));
+    assert_eq!(account[0].api_key.as_deref(), Some(FAKE_API_KEY));
 }
 
 #[test]
@@ -234,10 +219,9 @@ fn live_entry_rejected_with_a_binance_error_body_fails_the_run() {
     );
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    trade_run_live(&mock, &db_path, "e2e-reject-1", "error")
+    trade_run_live(&mock, &bed, "e2e-reject-1", "error")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -246,7 +230,7 @@ fn live_entry_rejected_with_a_binance_error_body_fails_the_run() {
         .stderr(predicate::str::contains("-2010"));
 
     // The failed entry is journaled as a failed run with no position.
-    let store = SqliteStore::new(&db_path);
+    let store = bed.store();
     let state = store
         .load_run_state("e2e-reject-1")
         .expect("load run")
@@ -268,10 +252,9 @@ fn rate_limited_klines_surface_the_http_status_as_an_api_error() {
     );
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    trade_run_live(&mock, &db_path, "e2e-limited-1", "error")
+    trade_run_live(&mock, &bed, "e2e-limited-1", "error")
         .assert()
         .failure()
         .stderr(predicate::str::contains("code=Some(429)"))
@@ -289,10 +272,9 @@ fn teapot_from_an_ip_ban_surfaces_the_binance_error_body() {
     );
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    trade_run_live(&mock, &db_path, "e2e-teapot-1", "error")
+    trade_run_live(&mock, &bed, "e2e-teapot-1", "error")
         .assert()
         .failure()
         .stderr(predicate::str::contains("code=Some(-1003)"))
@@ -316,10 +298,9 @@ fn ack_only_order_response_aborts_the_entry_loudly() {
     scenario.order_response(order_ack_response("BUY", 2_001));
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    trade_run_live(&mock, &db_path, "e2e-ack-1", "error")
+    trade_run_live(&mock, &bed, "e2e-ack-1", "error")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -346,10 +327,9 @@ fn malformed_filters_degrade_loudly_and_the_run_still_completes() {
     }));
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    let mut cmd = trade_run_live(&mock, &db_path, "e2e-malformed-1", "warn");
+    let mut cmd = trade_run_live(&mock, &bed, "e2e-malformed-1", "warn");
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("no lot-size step"))
@@ -369,20 +349,10 @@ fn monitor_status_reads_account_orders_and_trades_offline() {
     ]));
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    let mut cmd = Command::cargo_bin("quantforge").expect("binary");
-    cmd.env_remove("QF_BINANCE_BASE_URL")
-        .env("QF_BINANCE_API_KEY", "test-key")
-        .env("QF_BINANCE_API_SECRET", "test-secret")
-        .arg("--db")
-        .arg(&db_path)
-        .arg("--log-level")
-        .arg("error")
-        .arg("--binance-base-url")
-        .arg(mock.base_url())
-        .args(["monitor", "status", "--symbol", "BTCUSDT"]);
+    let mut cmd = offline_cmd(&bed, &mock);
+    cmd.args(["monitor", "status", "--symbol", "BTCUSDT"]);
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("BTC free=0.05000000"))
@@ -394,7 +364,7 @@ fn monitor_status_reads_account_orders_and_trades_offline() {
             .iter()
             .find(|request| request.path == path)
             .unwrap_or_else(|| panic!("missing request to {path}"));
-        assert_eq!(request.api_key.as_deref(), Some("test-key"));
+        assert_eq!(request.api_key.as_deref(), Some(FAKE_API_KEY));
         assert!(request.has_param_named("signature"));
     }
 }
@@ -405,28 +375,18 @@ fn monitor_cancel_order_sends_a_delete_when_confirmed() {
     scenario.order_cancel_response(order_query_response("SELL", 42, "0.00000000"));
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    let mut cmd = Command::cargo_bin("quantforge").expect("binary");
-    cmd.env_remove("QF_BINANCE_BASE_URL")
-        .env("QF_BINANCE_API_KEY", "test-key")
-        .env("QF_BINANCE_API_SECRET", "test-secret")
-        .arg("--db")
-        .arg(&db_path)
-        .arg("--log-level")
-        .arg("error")
-        .arg("--binance-base-url")
-        .arg(mock.base_url())
-        .args([
-            "monitor",
-            "cancel-order",
-            "--symbol",
-            "BTCUSDT",
-            "--order-id",
-            "42",
-            "--yes",
-        ]);
+    let mut cmd = offline_cmd(&bed, &mock);
+    cmd.args([
+        "monitor",
+        "cancel-order",
+        "--symbol",
+        "BTCUSDT",
+        "--order-id",
+        "42",
+        "--yes",
+    ]);
     cmd.assert().success();
 
     let requests = mock.requests();
@@ -436,7 +396,7 @@ fn monitor_cancel_order_sends_a_delete_when_confirmed() {
         .expect("delete request");
     assert!(cancel.has_param("symbol", "BTCUSDT"));
     assert!(cancel.has_param("orderId", "42"));
-    assert_eq!(cancel.api_key.as_deref(), Some("test-key"));
+    assert_eq!(cancel.api_key.as_deref(), Some(FAKE_API_KEY));
 }
 
 // The mock's under-scripting rail: an endpoint with no queued response
@@ -450,20 +410,10 @@ fn unscripted_endpoints_fail_loudly_instead_of_inventing_payloads() {
     // account/openOrders/myTrades deliberately left unscripted.
     let mock = MockBinance::start(scenario);
 
-    let tempdir = tempdir().expect("tempdir");
-    let db_path = tempdir.path().join("market.sqlite");
+    let bed = TestBed::new();
 
-    let mut cmd = Command::cargo_bin("quantforge").expect("binary");
-    cmd.env_remove("QF_BINANCE_BASE_URL")
-        .env("QF_BINANCE_API_KEY", "test-key")
-        .env("QF_BINANCE_API_SECRET", "test-secret")
-        .arg("--db")
-        .arg(&db_path)
-        .arg("--log-level")
-        .arg("error")
-        .arg("--binance-base-url")
-        .arg(mock.base_url())
-        .args(["monitor", "status", "--symbol", "BTCUSDT"]);
+    let mut cmd = offline_cmd(&bed, &mock);
+    cmd.args(["monitor", "status", "--symbol", "BTCUSDT"]);
     cmd.assert().failure().stderr(predicate::str::contains(
         "unscripted mock endpoint: GET /api/v3/account",
     ));
@@ -481,8 +431,8 @@ async fn order_query_without_fills_parses_as_missing_fill_data() {
     let client =
         quantforge::BinanceSpotClient::new(url::Url::parse(&mock.base_url()).expect("mock url"))
             .with_credentials(quantforge::BinanceCredentials {
-                api_key: "test-key".to_string(),
-                secret: "test-secret".to_string(),
+                api_key: FAKE_API_KEY.to_string(),
+                secret: FAKE_API_SECRET.to_string(),
             });
 
     let order = quantforge::TradingVenue::query_order(
@@ -503,4 +453,66 @@ async fn order_query_without_fills_parses_as_missing_fill_data() {
         Some(Decimal::from_str("0.01").expect("decimal"))
     );
     assert!(order.average_price().is_some());
+}
+
+// The named trivial offline-tier e2e: TestBed + isolation + parser, no
+// mock, no network.
+#[test]
+fn offline_smoke_data_validate_runs_green_on_an_isolated_fresh_db() {
+    let bed = TestBed::new();
+    let mut cmd = cli_cmd(&bed, "error");
+    cmd.args([
+        "data",
+        "validate",
+        "--symbol",
+        "BTCUSDT",
+        "--interval",
+        "1m",
+    ]);
+    let assert = cmd.assert().success();
+
+    let output = CliOutput::from_assert(&assert);
+    assert_eq!(output.get("market"), Some("binance_spot BTCUSDT 1m"));
+    assert_eq!(output.get("candles"), Some("0"));
+    assert_eq!(output.get("issues"), Some("0"));
+}
+
+// Isolation proofs are behavioral: a developer shell that sources .env
+// exports a base-URL override and real credentials, so if env_clear ever
+// regresses these fail locally while staying trivially green in CI.
+
+#[test]
+fn isolated_commands_use_the_default_base_url_ignoring_the_shell_environment() {
+    // The startup log (info level, stdout) names the effective base URL;
+    // data validate never touches the network.
+    let bed = TestBed::new();
+    let mut cmd = cli_cmd(&bed, "info");
+    cmd.args([
+        "data",
+        "validate",
+        "--symbol",
+        "BTCUSDT",
+        "--interval",
+        "1m",
+    ]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("https://api.binance.com/"));
+}
+
+#[test]
+fn isolated_commands_do_not_inherit_shell_credentials() {
+    // Unroutable URL backstop: if isolation regressed AND the credential
+    // gate somehow passed, the run would still die on a refused connection
+    // instead of reaching a real exchange.
+    let bed = TestBed::new();
+    let mut cmd = cli_cmd(&bed, "error");
+    cmd.arg("--binance-base-url")
+        .arg("http://127.0.0.1:9/")
+        .args([
+            "trade", "run", "--symbol", "BTCUSDT", "--mode", "live", "--yes",
+        ]);
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "trade run --mode live requires Binance credentials",
+    ));
 }
