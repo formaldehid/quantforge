@@ -1,6 +1,7 @@
 //! Command-line interface: the root parser, the command tree, and (until
 //! the per-command split) every argument struct and handler.
 
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use quantforge::ExecutionMode;
 use std::path::PathBuf;
@@ -8,21 +9,61 @@ use std::path::PathBuf;
 mod commands;
 mod context;
 
-pub(crate) use context::AppContext;
+use context::AppContext;
 
 // Args types are only named by the Command enum below; the handlers are
-// what main.rs dispatches to, and display_url is shared with context.rs.
+// dispatched by run(), and display_url is shared with context.rs.
 use commands::{
     BacktestArgs, DataSyncArgs, DataValidateArgs, MonitorCancelOrderArgs, MonitorClosePositionArgs,
     MonitorOrdersArgs, MonitorStatusArgs, MonitorTradesArgs, MonitorWatchArgs, TradeCloseArgs,
     TradeRunArgs,
 };
-pub(crate) use commands::{
+use commands::{
     display_url, handle_backtest, handle_data_sync, handle_data_validate,
     handle_monitor_cancel_order, handle_monitor_close_position, handle_monitor_orders,
     handle_monitor_status, handle_monitor_trades, handle_monitor_watch, handle_trade_close,
     handle_trade_run,
 };
+
+/// Build the per-invocation context and dispatch the parsed command.
+pub(crate) async fn run(cli: Cli) -> Result<()> {
+    let ctx = AppContext::init(&cli)?;
+
+    match cli.command {
+        Command::Data { command } => match command {
+            DataCommand::Sync(args) => handle_data_sync(&ctx, args).await?,
+            DataCommand::Validate(args) => handle_data_validate(&ctx, args)?,
+        },
+        Command::Backtest(args) => handle_backtest(&ctx, args)?,
+        Command::Trade { command } => match command {
+            TradeCommand::Run(args) => handle_trade_run(&ctx, args).await?,
+            TradeCommand::Close(args) => handle_trade_close(&ctx, args).await?,
+        },
+        Command::Monitor { command } => {
+            let private_client = ctx.require_private_client(
+                "monitor commands require QF_BINANCE_API_KEY and QF_BINANCE_API_SECRET",
+            )?;
+            match command {
+                MonitorCommand::Status(args) => {
+                    handle_monitor_status(&ctx.store, private_client, args).await?
+                }
+                MonitorCommand::Watch(args) => {
+                    handle_monitor_watch(&ctx.store, private_client, args).await?
+                }
+                MonitorCommand::Orders(args) => handle_monitor_orders(private_client, args).await?,
+                MonitorCommand::Trades(args) => handle_monitor_trades(private_client, args).await?,
+                MonitorCommand::CancelOrder(args) => {
+                    handle_monitor_cancel_order(private_client, args).await?
+                }
+                MonitorCommand::ClosePosition(args) => {
+                    handle_monitor_close_position(private_client, args).await?
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Production Binance Spot endpoint — the default when neither
 /// `--binance-base-url` nor `QF_BINANCE_BASE_URL` is set.
