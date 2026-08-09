@@ -1,7 +1,9 @@
 //! Argument structs, handlers, and their helpers for every command.
 //! Temporary home until the per-command split (`cli/data`, `cli/trade`, ...).
 
-use super::CliExecutionMode;
+use super::common::{
+    CliExecutionMode, ConfirmArgs, MarketArgs, PollArgs, StrategyArgs, SymbolArgs,
+};
 use super::context::{self, AppContext};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
@@ -24,10 +26,8 @@ use url::Url;
 
 #[derive(Args, Debug)]
 pub(crate) struct DataSyncArgs {
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value = "1m")]
-    interval: String,
+    #[command(flatten)]
+    market: MarketArgs,
     /// RFC3339 start time. Omit to begin syncing from the current time.
     #[arg(long)]
     start: Option<String>,
@@ -39,18 +39,14 @@ pub(crate) struct DataSyncArgs {
     /// When --end is set, keep polling until that end boundary is reached.
     #[arg(long, default_value_t = false)]
     follow: bool,
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
-    poll_secs: u64,
-    #[arg(long)]
-    max_loops: Option<usize>,
+    #[command(flatten)]
+    poll: PollArgs,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct DataValidateArgs {
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value = "1m")]
-    interval: String,
+    #[command(flatten)]
+    market: MarketArgs,
     #[arg(long)]
     start: Option<String>,
     #[arg(long)]
@@ -59,10 +55,8 @@ pub(crate) struct DataValidateArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct BacktestArgs {
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value = "1m")]
-    interval: String,
+    #[command(flatten)]
+    market: MarketArgs,
     #[arg(long)]
     start: Option<String>,
     #[arg(long)]
@@ -79,10 +73,8 @@ pub(crate) struct BacktestArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct TradeRunArgs {
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value = "1m")]
-    interval: String,
+    #[command(flatten)]
+    market: MarketArgs,
     #[arg(long, default_value_t = 20)]
     fast: usize,
     #[arg(long, default_value_t = 50)]
@@ -91,8 +83,10 @@ pub(crate) struct TradeRunArgs {
     quote_order_qty: String,
     #[arg(long, value_enum, default_value_t = CliExecutionMode::DryRun)]
     mode: CliExecutionMode,
-    #[arg(long, default_value_t = false)]
-    yes: bool,
+    #[command(flatten)]
+    confirm: ConfirmArgs,
+    // poll_secs/max_loops stay raw here: they are not adjacent in this
+    // struct, and flattening PollArgs would reorder `trade run --help`.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     poll_secs: u64,
     #[arg(long, default_value_t = 300)]
@@ -109,78 +103,70 @@ pub(crate) struct TradeRunArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct TradeCloseArgs {
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value = "1m")]
-    interval: String,
-    #[arg(long, default_value = "sma_cross")]
-    strategy_name: String,
+    #[command(flatten)]
+    market: MarketArgs,
+    #[command(flatten)]
+    strategy: StrategyArgs,
     #[arg(long)]
     run_id: Option<String>,
-    #[arg(long, default_value_t = false)]
-    yes: bool,
+    #[command(flatten)]
+    confirm: ConfirmArgs,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitorStatusArgs {
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value = "1m")]
-    interval: String,
-    #[arg(long, default_value = "sma_cross")]
-    strategy_name: String,
+    #[command(flatten)]
+    market: MarketArgs,
+    #[command(flatten)]
+    strategy: StrategyArgs,
     #[arg(long, default_value_t = 10)]
     recent_trades: usize,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitorWatchArgs {
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value = "1m")]
-    interval: String,
-    #[arg(long, default_value = "sma_cross")]
-    strategy_name: String,
+    #[command(flatten)]
+    market: MarketArgs,
+    #[command(flatten)]
+    strategy: StrategyArgs,
     #[arg(long, default_value_t = 10)]
     recent_trades: usize,
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
-    poll_secs: u64,
-    #[arg(long)]
-    max_loops: Option<usize>,
+    #[command(flatten)]
+    poll: PollArgs,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitorOrdersArgs {
-    #[arg(long)]
-    symbol: String,
+    #[command(flatten)]
+    symbol: SymbolArgs,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitorTradesArgs {
-    #[arg(long)]
-    symbol: String,
+    #[command(flatten)]
+    symbol: SymbolArgs,
     #[arg(long, default_value_t = 20)]
     limit: usize,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitorCancelOrderArgs {
-    #[arg(long)]
-    symbol: String,
+    #[command(flatten)]
+    symbol: SymbolArgs,
     #[arg(long)]
     order_id: Option<i64>,
     #[arg(long)]
     client_order_id: Option<String>,
-    #[arg(long, default_value_t = false)]
-    yes: bool,
+    #[command(flatten)]
+    confirm: ConfirmArgs,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitorClosePositionArgs {
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value_t = false)]
-    yes: bool,
+    #[command(flatten)]
+    symbol: SymbolArgs,
+    #[command(flatten)]
+    confirm: ConfirmArgs,
 }
 
 fn parse_market(symbol: String, interval: String) -> Result<MarketId> {
@@ -240,7 +226,7 @@ fn strategy_config(fast: usize, slow: usize) -> BuiltInStrategyConfig {
 pub(crate) async fn handle_data_sync(ctx: &AppContext, args: DataSyncArgs) -> Result<()> {
     let store = &ctx.store;
     let client = &ctx.public_client;
-    let market = parse_market(args.symbol, args.interval)?;
+    let market = parse_market(args.market.symbol, args.market.interval)?;
     let engine = DataSyncEngine::new(client, store);
     let summary = engine
         .run(&DataSyncConfig {
@@ -259,8 +245,8 @@ pub(crate) async fn handle_data_sync(ctx: &AppContext, args: DataSyncArgs) -> Re
                 .context("failed to parse --end")?,
             batch_limit: args.limit,
             follow: args.follow,
-            poll_interval: Duration::from_secs(args.poll_secs),
-            max_loops: args.max_loops,
+            poll_interval: Duration::from_secs(args.poll.poll_secs),
+            max_loops: args.poll.max_loops,
         })
         .await?;
 
@@ -285,7 +271,7 @@ pub(crate) async fn handle_data_sync(ctx: &AppContext, args: DataSyncArgs) -> Re
 
 pub(crate) fn handle_data_validate(ctx: &AppContext, args: DataValidateArgs) -> Result<()> {
     let store = &ctx.store;
-    let market = parse_market(args.symbol, args.interval)?;
+    let market = parse_market(args.market.symbol, args.market.interval)?;
     let candles = store.load_candles(
         &market,
         CandleQuery {
@@ -326,7 +312,7 @@ pub(crate) fn handle_data_validate(ctx: &AppContext, args: DataValidateArgs) -> 
 
 pub(crate) fn handle_backtest(ctx: &AppContext, args: BacktestArgs) -> Result<()> {
     let store = &ctx.store;
-    let market = parse_market(args.symbol, args.interval)?;
+    let market = parse_market(args.market.symbol, args.market.interval)?;
     let initial_cash = parse_positive_decimal("--cash", &args.cash)?;
     let fee_bps = parse_non_negative_decimal("--fee-bps", &args.fee_bps)?;
     let candles = store.load_candles(
@@ -382,11 +368,11 @@ pub(crate) async fn handle_trade_run(ctx: &AppContext, args: TradeRunArgs) -> Re
     let public_client = &ctx.public_client;
     let private_client = ctx.private_client.as_ref();
     let base_url = &ctx.base_url;
-    let market = parse_market(args.symbol, args.interval)?;
+    let market = parse_market(args.market.symbol, args.market.interval)?;
     let quote_order_qty = parse_positive_decimal("--quote-order-qty", &args.quote_order_qty)?;
 
     if matches!(args.mode, CliExecutionMode::Live) {
-        if !args.yes {
+        if !args.confirm.yes {
             let strategy_name = strategy_config(args.fast, args.slow).strategy_name();
             let url_note = if is_production_binance_url(base_url) {
                 " (PRODUCTION)"
@@ -480,7 +466,7 @@ pub(crate) async fn handle_trade_close(ctx: &AppContext, args: TradeCloseArgs) -
     let private_client = ctx.require_private_client(
         "trade close requires QF_BINANCE_API_KEY and QF_BINANCE_API_SECRET",
     )?;
-    let market = parse_market(args.symbol, args.interval)?;
+    let market = parse_market(args.market.symbol, args.market.interval)?;
     let rules = private_client.fetch_symbol_rules(&market.symbol).await?;
     let mut run_state = if let Some(run_id) = args.run_id {
         store
@@ -488,7 +474,7 @@ pub(crate) async fn handle_trade_close(ctx: &AppContext, args: TradeCloseArgs) -
             .ok_or_else(|| anyhow!("no run found for run_id={run_id}"))?
     } else {
         store
-            .latest_run_for_market(&market, &args.strategy_name)?
+            .latest_run_for_market(&market, &args.strategy.strategy_name)?
             .ok_or_else(|| {
                 anyhow!(
                     "no run found for market={} interval={} strategy={}; runs are selected \
@@ -496,7 +482,7 @@ pub(crate) async fn handle_trade_close(ctx: &AppContext, args: TradeCloseArgs) -
                      used non-default values",
                     market.symbol,
                     market.interval,
-                    args.strategy_name
+                    args.strategy.strategy_name
                 )
             })?
     };
@@ -519,7 +505,7 @@ pub(crate) async fn handle_trade_close(ctx: &AppContext, args: TradeCloseArgs) -
     let qty = round_quantity_for_rules(free_base_qty.min(run_state.position.qty), &rules);
     println!("run_id: {}", run_state.run_id);
     println!("sell_qty: {}", qty);
-    if !args.yes {
+    if !args.confirm.yes {
         println!("No order sent. Re-run with --yes to execute the market sell.");
         return Ok(());
     }
@@ -644,14 +630,14 @@ pub(crate) async fn handle_monitor_status(
     private_client: &BinanceSpotClient,
     args: MonitorStatusArgs,
 ) -> Result<()> {
-    let market = parse_market(args.symbol, args.interval)?;
+    let market = parse_market(args.market.symbol, args.market.interval)?;
     let rules = private_client.fetch_symbol_rules(&market.symbol).await?;
     let balances = private_client.account_balances().await?;
     let open_orders = private_client.open_orders(Some(&market.symbol)).await?;
     let trades = private_client
         .recent_trades(&market.symbol, args.recent_trades)
         .await?;
-    let run = store.latest_run_for_market(&market, &args.strategy_name)?;
+    let run = store.latest_run_for_market(&market, &args.strategy.strategy_name)?;
 
     println!("symbol: {}", market.symbol);
     println!("base_asset: {}", rules.base_asset);
@@ -742,21 +728,25 @@ pub(crate) async fn handle_monitor_watch(
             store,
             private_client,
             MonitorStatusArgs {
-                symbol: args.symbol.clone(),
-                interval: args.interval.clone(),
-                strategy_name: args.strategy_name.clone(),
+                market: MarketArgs {
+                    symbol: args.market.symbol.clone(),
+                    interval: args.market.interval.clone(),
+                },
+                strategy: StrategyArgs {
+                    strategy_name: args.strategy.strategy_name.clone(),
+                },
                 recent_trades: args.recent_trades,
             },
         )
         .await?;
 
         loops += 1;
-        if args.max_loops.map(|max| loops >= max).unwrap_or(false) {
+        if args.poll.max_loops.map(|max| loops >= max).unwrap_or(false) {
             break;
         }
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(args.poll_secs)) => {}
+            _ = tokio::time::sleep(Duration::from_secs(args.poll.poll_secs)) => {}
             _ = tokio::signal::ctrl_c() => break,
         }
     }
@@ -768,7 +758,7 @@ pub(crate) async fn handle_monitor_orders(
     private_client: &BinanceSpotClient,
     args: MonitorOrdersArgs,
 ) -> Result<()> {
-    let symbol = Symbol::new(args.symbol)?;
+    let symbol = Symbol::new(args.symbol.symbol)?;
     let orders = private_client.open_orders(Some(&symbol)).await?;
     println!("open_orders: {}", orders.len());
     for order in orders {
@@ -781,7 +771,7 @@ pub(crate) async fn handle_monitor_trades(
     private_client: &BinanceSpotClient,
     args: MonitorTradesArgs,
 ) -> Result<()> {
-    let symbol = Symbol::new(args.symbol)?;
+    let symbol = Symbol::new(args.symbol.symbol)?;
     let trades = private_client.recent_trades(&symbol, args.limit).await?;
     println!("recent_trades: {}", trades.len());
     for trade in trades {
@@ -805,8 +795,8 @@ pub(crate) async fn handle_monitor_cancel_order(
     private_client: &BinanceSpotClient,
     args: MonitorCancelOrderArgs,
 ) -> Result<()> {
-    let symbol = Symbol::new(args.symbol)?;
-    if !args.yes {
+    let symbol = Symbol::new(args.symbol.symbol)?;
+    if !args.confirm.yes {
         println!("No order canceled. Re-run with --yes to execute the cancel.");
         return Ok(());
     }
@@ -825,7 +815,7 @@ pub(crate) async fn handle_monitor_close_position(
     private_client: &BinanceSpotClient,
     args: MonitorClosePositionArgs,
 ) -> Result<()> {
-    let symbol = Symbol::new(args.symbol)?;
+    let symbol = Symbol::new(args.symbol.symbol)?;
     let rules = private_client.fetch_symbol_rules(&symbol).await?;
     let balances = private_client.account_balances().await?;
     let free_base_qty = balances
@@ -837,7 +827,7 @@ pub(crate) async fn handle_monitor_close_position(
 
     println!("base_asset: {}", rules.base_asset);
     println!("sell_qty: {}", qty);
-    if !args.yes {
+    if !args.confirm.yes {
         println!("No order sent. Re-run with --yes to execute the market sell.");
         return Ok(());
     }
