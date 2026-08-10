@@ -1,28 +1,24 @@
-//! Argument structs, handlers, and their helpers for every command.
-//! Temporary home until the per-command split (`cli/data`, `cli/trade`, ...).
+//! Argument structs, handlers, and helpers for the data, backtest, and
+//! monitor commands. Temporary home until their per-command splits
+//! (`cli/data`, `cli/backtest`, `cli/monitor`); trade already lives in
+//! `cli/trade`.
 
 use super::common::{
-    CliExecutionMode, ConfirmArgs, MarketArgs, PollArgs, StrategyArgs, SymbolArgs,
+    ConfirmArgs, MarketArgs, PollArgs, StrategyArgs, SymbolArgs, parse_market,
+    parse_non_negative_decimal, parse_positive_decimal, strategy_config,
 };
-use super::context::{self, AppContext};
-use anyhow::{Context, Result, anyhow, bail};
+use super::context::AppContext;
+use anyhow::{Context, Result, bail};
 use clap::Args;
 use quantforge::SqliteStore;
+use quantforge::{BacktestConfig, BacktestEngine, DataSyncConfig, DataSyncEngine};
 use quantforge::{
-    BacktestConfig, BacktestEngine, DataSyncConfig, DataSyncEngine, LiveTradeConfig,
-    LiveTradeEngine,
-};
-use quantforge::{
-    BinanceSpotClient, BuiltInStrategyConfig, CandleQuery, CandleStore, ClosedTrade, ExchangeId,
-    ExecutionMode, Interval, MarketDataSource, MarketId, PositionState, RunJournalStore, Side,
-    Symbol, TradingVenue, ms_to_rfc3339, now_utc_ms, parse_rfc3339_to_ms, round_down_to_step,
+    BinanceSpotClient, CandleQuery, CandleStore, MarketDataSource, RunJournalStore, Side, Symbol,
+    TradingVenue, ms_to_rfc3339, now_utc_ms, parse_rfc3339_to_ms, round_down_to_step,
     validate_candles,
 };
 use rust_decimal::Decimal;
-use std::io::{self, IsTerminal};
 use std::time::Duration;
-use tracing::warn;
-use url::Url;
 
 #[derive(Args, Debug)]
 pub(crate) struct DataSyncArgs {
@@ -69,48 +65,6 @@ pub(crate) struct BacktestArgs {
     cash: String,
     #[arg(long, default_value = "10")]
     fee_bps: String,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TradeRunArgs {
-    #[command(flatten)]
-    market: MarketArgs,
-    #[arg(long, default_value_t = 20)]
-    fast: usize,
-    #[arg(long, default_value_t = 50)]
-    slow: usize,
-    #[arg(long, default_value = "100")]
-    quote_order_qty: String,
-    #[arg(long, value_enum, default_value_t = CliExecutionMode::DryRun)]
-    mode: CliExecutionMode,
-    #[command(flatten)]
-    confirm: ConfirmArgs,
-    // poll_secs/max_loops stay raw here: they are not adjacent in this
-    // struct, and flattening PollArgs would reorder `trade run --help`.
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
-    poll_secs: u64,
-    #[arg(long, default_value_t = 300)]
-    bootstrap_bars: usize,
-    #[arg(long, default_value_t = false)]
-    bootstrap_enter: bool,
-    #[arg(long, default_value_t = 1000)]
-    limit: u16,
-    #[arg(long)]
-    run_id: Option<String>,
-    #[arg(long)]
-    max_loops: Option<usize>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TradeCloseArgs {
-    #[command(flatten)]
-    market: MarketArgs,
-    #[command(flatten)]
-    strategy: StrategyArgs,
-    #[arg(long)]
-    run_id: Option<String>,
-    #[command(flatten)]
-    confirm: ConfirmArgs,
 }
 
 #[derive(Args, Debug)]
@@ -167,60 +121,6 @@ pub(crate) struct MonitorClosePositionArgs {
     symbol: SymbolArgs,
     #[command(flatten)]
     confirm: ConfirmArgs,
-}
-
-fn parse_market(symbol: String, interval: String) -> Result<MarketId> {
-    let symbol = Symbol::new(symbol)?;
-    let interval = interval.parse::<Interval>()?;
-    Ok(MarketId::new(ExchangeId::BinanceSpot, symbol, interval))
-}
-
-fn parse_positive_decimal(flag: &str, raw: &str) -> Result<Decimal> {
-    let value = raw
-        .trim()
-        .parse::<Decimal>()
-        .with_context(|| format!("failed to parse {flag}: {raw}"))?;
-    if value <= Decimal::ZERO {
-        bail!("{flag} must be greater than 0, got {raw}");
-    }
-    Ok(value)
-}
-
-fn parse_non_negative_decimal(flag: &str, raw: &str) -> Result<Decimal> {
-    let value = raw
-        .trim()
-        .parse::<Decimal>()
-        .with_context(|| format!("failed to parse {flag}: {raw}"))?;
-    if value < Decimal::ZERO {
-        bail!("{flag} must be zero or greater, got {raw}");
-    }
-    Ok(value)
-}
-
-const PRODUCTION_BINANCE_DOMAINS: [&str; 2] = ["binance.com", "binance.us"];
-
-fn is_production_binance_url(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    PRODUCTION_BINANCE_DOMAINS.iter().any(|domain| {
-        host == *domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
-}
-
-pub(crate) fn display_url(url: &Url) -> Url {
-    let mut redacted = url.clone();
-    let _ = redacted.set_username("");
-    let _ = redacted.set_password(None);
-    redacted
-}
-
-fn strategy_config(fast: usize, slow: usize) -> BuiltInStrategyConfig {
-    BuiltInStrategyConfig::SmaCross { fast, slow }
 }
 
 pub(crate) async fn handle_data_sync(ctx: &AppContext, args: DataSyncArgs) -> Result<()> {
@@ -360,268 +260,6 @@ pub(crate) fn handle_backtest(ctx: &AppContext, args: BacktestArgs) -> Result<()
             trade.gross_quote_pnl
         );
     }
-    Ok(())
-}
-
-pub(crate) async fn handle_trade_run(ctx: &AppContext, args: TradeRunArgs) -> Result<()> {
-    let store = &ctx.store;
-    let public_client = &ctx.public_client;
-    let private_client = ctx.private_client.as_ref();
-    let base_url = &ctx.base_url;
-    let market = parse_market(args.market.symbol, args.market.interval)?;
-    let quote_order_qty = parse_positive_decimal("--quote-order-qty", &args.quote_order_qty)?;
-
-    if matches!(args.mode, CliExecutionMode::Live) {
-        if !args.confirm.yes {
-            let strategy_name = strategy_config(args.fast, args.slow).strategy_name();
-            let url_note = if is_production_binance_url(base_url) {
-                " (PRODUCTION)"
-            } else {
-                ""
-            };
-            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-            if !interactive {
-                println!("refusing to start live trading without --yes");
-                println!(
-                    "would run strategy {} on {} {} {}",
-                    strategy_name, market.exchange, market.symbol, market.interval
-                );
-                println!("with REAL orders via {}{}", display_url(base_url), url_note);
-                if args.bootstrap_enter {
-                    println!("note: --bootstrap-enter may place an order on the first loop");
-                }
-                println!("re-run with --yes to confirm, or use --mode dry-run");
-                return Ok(());
-            }
-            println!("about to start live trading:");
-            println!(
-                "strategy {} on {} {} {}",
-                strategy_name, market.exchange, market.symbol, market.interval
-            );
-            println!("REAL orders via {}{}", display_url(base_url), url_note);
-            if args.bootstrap_enter {
-                println!("note: --bootstrap-enter may place an order on the first loop");
-            }
-            if !context::prompt_confirmation("type 'yes' to confirm, anything else aborts: ")? {
-                println!("aborted; no orders sent");
-                return Ok(());
-            }
-        }
-        if is_production_binance_url(base_url) {
-            warn!(
-                base_url = %display_url(base_url),
-                "live trading against PRODUCTION Binance; real funds at risk"
-            );
-        }
-    }
-
-    let engine = LiveTradeEngine::new(
-        public_client,
-        store,
-        store,
-        if matches!(args.mode, CliExecutionMode::Live) {
-            Some(
-                private_client
-                    .ok_or_else(|| anyhow!("trade run --mode live requires Binance credentials"))?
-                    as &dyn TradingVenue,
-            )
-        } else {
-            None
-        },
-    );
-
-    let summary = engine
-        .run(&LiveTradeConfig {
-            market,
-            strategy: strategy_config(args.fast, args.slow),
-            execution_mode: args.mode.into(),
-            quote_order_qty,
-            poll_interval: Duration::from_secs(args.poll_secs),
-            bootstrap_bars: args.bootstrap_bars,
-            bootstrap_enter: args.bootstrap_enter,
-            batch_limit: args.limit,
-            run_id: args.run_id,
-            max_loops: args.max_loops,
-        })
-        .await?;
-
-    println!("run_id: {}", summary.run_id);
-    println!("processed_bars: {}", summary.processed_bars);
-    println!("submitted_orders: {}", summary.submitted_orders);
-    println!("closed_trades: {}", summary.closed_trades);
-    println!(
-        "last_processed_open_time: {}",
-        summary
-            .last_processed_open_time_ms
-            .map(ms_to_rfc3339)
-            .unwrap_or_else(|| "none".to_string())
-    );
-    Ok(())
-}
-
-pub(crate) async fn handle_trade_close(ctx: &AppContext, args: TradeCloseArgs) -> Result<()> {
-    let store = &ctx.store;
-    // Credential gate before parsing, preserving the ordering the dispatch
-    // in main.rs used before the context extraction.
-    let private_client = ctx.require_private_client(
-        "trade close requires QF_BINANCE_API_KEY and QF_BINANCE_API_SECRET",
-    )?;
-    let market = parse_market(args.market.symbol, args.market.interval)?;
-    let rules = private_client.fetch_symbol_rules(&market.symbol).await?;
-    let mut run_state = if let Some(run_id) = args.run_id {
-        store
-            .load_run_state(&run_id)?
-            .ok_or_else(|| anyhow!("no run found for run_id={run_id}"))?
-    } else {
-        store
-            .latest_run_for_market(&market, &args.strategy.strategy_name)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "no run found for market={} interval={} strategy={}; runs are selected \
-                     by --interval and --strategy-name, so pass them explicitly if the bot \
-                     used non-default values",
-                    market.symbol,
-                    market.interval,
-                    args.strategy.strategy_name
-                )
-            })?
-    };
-
-    if run_state.execution_mode == ExecutionMode::DryRun {
-        bail!(
-            "run {} was recorded in dry-run mode; its position is synthetic and there is \
-             nothing to close on the exchange",
-            run_state.run_id
-        );
-    }
-
-    let balances = private_client.account_balances().await?;
-    let free_base_qty = balances
-        .iter()
-        .find(|balance| balance.asset.eq_ignore_ascii_case(&rules.base_asset))
-        .map(|balance| balance.free)
-        .unwrap_or(Decimal::ZERO);
-
-    let qty = round_quantity_for_rules(free_base_qty.min(run_state.position.qty), &rules);
-    println!("run_id: {}", run_state.run_id);
-    println!("sell_qty: {}", qty);
-    if !args.confirm.yes {
-        println!("No order sent. Re-run with --yes to execute the market sell.");
-        return Ok(());
-    }
-    if qty <= Decimal::ZERO {
-        bail!("no sellable quantity available for {}", rules.base_asset);
-    }
-    if run_state.position.is_open() && run_state.position.entry_price.is_none() {
-        bail!(
-            "run {} has no recorded entry price; closing it here would fabricate PnL. \
-             Use `monitor close-position --symbol {} --yes` to sell without writing a trade record",
-            run_state.run_id,
-            market.symbol
-        );
-    }
-
-    let order = private_client
-        .submit_market_order(&quantforge::MarketOrderRequest {
-            symbol: market.symbol.clone(),
-            side: Side::Sell,
-            quantity: Some(qty),
-            quote_order_qty: None,
-            new_client_order_id: Some(format!("manual-close-{}", now_utc_ms())),
-        })
-        .await?;
-
-    // Journal the order event, but defer any journaling failure until the
-    // position mutation below is persisted: the executed sell must be
-    // reflected in run state even when the journal write fails.
-    let order_event_result = store
-        .append_order_event(&run_state.run_id, &order)
-        .map_err(|err| {
-            anyhow!(
-                "order executed but journaling the order event failed ({err}); \
-                 reconcile manually with `monitor status`"
-            )
-        });
-
-    let executed_qty = order.executed_qty.ok_or_else(|| {
-        anyhow!(
-            "exchange did not report an executed quantity for order {:?}; run state left \
-             unchanged — reconcile manually with `monitor status`",
-            order.order_id
-        )
-    })?;
-
-    if run_state.position.is_open() && executed_qty > Decimal::ZERO {
-        // The sell has executed, so position state is updated and persisted
-        // before anything below can fail; a missing fill price then aborts
-        // with a clear error instead of recording fabricated PnL.
-        let position_before = run_state.position.clone();
-        let closed_qty = executed_qty.min(position_before.qty);
-        let remaining_qty = (position_before.qty - closed_qty).max(Decimal::ZERO);
-        let tradeable_remnant = round_quantity_for_rules(remaining_qty, &rules);
-        let remnant_is_dust = remaining_qty > Decimal::ZERO
-            && (tradeable_remnant <= Decimal::ZERO
-                || rules
-                    .effective_market_min_qty()
-                    .map(|min_qty| tradeable_remnant < min_qty)
-                    .unwrap_or(false));
-        run_state.updated_at_ms = now_utc_ms();
-        run_state.last_error = None;
-
-        if remaining_qty > Decimal::ZERO && !remnant_is_dust {
-            run_state.position.qty = remaining_qty;
-            run_state.status = quantforge::RunStatus::Running;
-            run_state.stopped_at_ms = None;
-        } else {
-            if remnant_is_dust {
-                warn!(
-                    written_off_qty = %remaining_qty,
-                    "position remnant after close is below the tradeable minimum; \
-                     writing it off so the run does not wedge on unsellable dust"
-                );
-            }
-            run_state.position = PositionState::flat();
-            run_state.status = quantforge::RunStatus::Stopped;
-            run_state.stopped_at_ms = Some(run_state.updated_at_ms);
-        }
-        store.save_run_state(&run_state)?;
-        order_event_result?;
-
-        let entry_price = position_before.entry_price.ok_or_else(|| {
-            anyhow!(
-                "run {} lost its recorded entry price; position state was updated but no \
-                 closed-trade row was written",
-                run_state.run_id
-            )
-        })?;
-        let exit_price = order.average_price().ok_or_else(|| {
-            anyhow!(
-                "exchange did not report a fill price for order {:?}; position state was \
-                 updated but no closed-trade row was written because its PnL would be fabricated",
-                order.order_id
-            )
-        })?;
-
-        let trade = ClosedTrade {
-            symbol: market.symbol.clone(),
-            entry_time_ms: position_before
-                .entry_time_ms
-                .or(order.transact_time_ms)
-                .unwrap_or_else(now_utc_ms),
-            exit_time_ms: order.transact_time_ms.unwrap_or_else(now_utc_ms),
-            entry_price,
-            exit_price,
-            qty: closed_qty,
-            gross_quote_pnl: (exit_price - entry_price) * closed_qty,
-            entry_order_id: position_before.entry_order_id,
-            exit_order_id: order.order_id,
-        };
-        store.append_closed_trade(&run_state.run_id, &trade)?;
-    } else {
-        order_event_result?;
-    }
-
-    print_order(&order);
     Ok(())
 }
 
@@ -848,14 +486,14 @@ pub(crate) async fn handle_monitor_close_position(
     Ok(())
 }
 
-fn round_quantity_for_rules(qty: Decimal, rules: &quantforge::SymbolRules) -> Decimal {
+pub(crate) fn round_quantity_for_rules(qty: Decimal, rules: &quantforge::SymbolRules) -> Decimal {
     match rules.effective_market_step_size() {
         Some(step_size) => round_down_to_step(qty, step_size),
         None => qty,
     }
 }
 
-fn print_order(order: &quantforge::ExchangeOrder) {
+pub(crate) fn print_order(order: &quantforge::ExchangeOrder) {
     let display_decimal = |value: Option<Decimal>| {
         value
             .map(|value| value.to_string())
@@ -872,93 +510,4 @@ fn print_order(order: &quantforge::ExchangeOrder) {
         display_decimal(order.cumulative_quote_qty),
         display_decimal(order.average_price())
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn positive_decimal_parses_valid_values() {
-        for (raw, expected) in [("100", "100"), ("0.001", "0.001"), (" 10 ", "10")] {
-            let value = parse_positive_decimal("--cash", raw).expect("decimal");
-            assert_eq!(value.to_string(), expected, "for input {raw:?}");
-        }
-    }
-
-    #[test]
-    fn positive_decimal_rejects_zero_and_negative_with_exact_message() {
-        for raw in ["0", "-5"] {
-            let error = parse_positive_decimal("--quote-order-qty", raw).expect_err("error");
-            assert_eq!(
-                error.to_string(),
-                format!("--quote-order-qty must be greater than 0, got {raw}"),
-                "for input {raw:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn non_negative_decimal_accepts_zero_and_rejects_negative() {
-        let zero = parse_non_negative_decimal("--fee-bps", "0").expect("decimal");
-        assert_eq!(zero, Decimal::ZERO);
-
-        let error = parse_non_negative_decimal("--fee-bps", "-1").expect_err("error");
-        assert_eq!(
-            error.to_string(),
-            "--fee-bps must be zero or greater, got -1"
-        );
-    }
-
-    #[test]
-    fn decimal_helpers_name_the_flag_on_parse_failure() {
-        let error = parse_positive_decimal("--cash", "abc").expect_err("error");
-        assert!(
-            error.to_string().contains("failed to parse --cash: abc"),
-            "got {error:#}"
-        );
-    }
-
-    #[test]
-    fn production_classifier_matches_production_hosts() {
-        for raw in [
-            "https://api.binance.com/",
-            "https://api1.binance.com/",
-            "https://api2.binance.com/",
-            "https://api3.binance.com/",
-            "https://api4.binance.com/",
-            "https://api-gcp.binance.com/",
-            "https://api5.binance.com/",
-            "https://api.binance.us/",
-            "https://binance.com/",
-            "https://API.BINANCE.COM/",
-            "https://api.binance.com:8443/",
-            "https://api.binance.com./",
-            "http://api1.binance.com/some/path",
-        ] {
-            let url = Url::parse(raw).expect("url");
-            assert!(is_production_binance_url(&url), "for input {raw:?}");
-        }
-    }
-
-    #[test]
-    fn production_classifier_rejects_testnet_local_and_lookalike_hosts() {
-        for raw in [
-            "https://testnet.binance.vision/",
-            "https://data-api.binance.vision/",
-            "http://127.0.0.1:9/",
-            "https://evil-binance.com/",
-            "https://api.binance.com.evil.example/",
-            "file:///tmp/no-host",
-        ] {
-            let url = Url::parse(raw).expect("url");
-            assert!(!is_production_binance_url(&url), "for input {raw:?}");
-        }
-    }
-
-    #[test]
-    fn display_url_strips_userinfo() {
-        let url = Url::parse("https://user:secret@api.binance.com/").expect("url");
-        assert_eq!(display_url(&url).as_str(), "https://api.binance.com/");
-    }
 }
