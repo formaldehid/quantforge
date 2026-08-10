@@ -8,22 +8,22 @@ use std::path::PathBuf;
 mod commands;
 mod common;
 mod context;
+mod trade;
 
 use context::AppContext;
 
 // Args types are only named by the Command enum below; the handlers are
-// dispatched by run(), and display_url is shared with context.rs.
+// dispatched by run().
 use commands::{
     BacktestArgs, DataSyncArgs, DataValidateArgs, MonitorCancelOrderArgs, MonitorClosePositionArgs,
-    MonitorOrdersArgs, MonitorStatusArgs, MonitorTradesArgs, MonitorWatchArgs, TradeCloseArgs,
-    TradeRunArgs,
+    MonitorOrdersArgs, MonitorStatusArgs, MonitorTradesArgs, MonitorWatchArgs,
 };
 use commands::{
-    display_url, handle_backtest, handle_data_sync, handle_data_validate,
-    handle_monitor_cancel_order, handle_monitor_close_position, handle_monitor_orders,
-    handle_monitor_status, handle_monitor_trades, handle_monitor_watch, handle_trade_close,
-    handle_trade_run,
+    handle_backtest, handle_data_sync, handle_data_validate, handle_monitor_cancel_order,
+    handle_monitor_close_position, handle_monitor_orders, handle_monitor_status,
+    handle_monitor_trades, handle_monitor_watch,
 };
+use trade::TradeCommand;
 
 /// Build the per-invocation context and dispatch the parsed command.
 pub(crate) async fn run(cli: Cli) -> Result<()> {
@@ -35,10 +35,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             DataCommand::Validate(args) => handle_data_validate(&ctx, args)?,
         },
         Command::Backtest(args) => handle_backtest(&ctx, args)?,
-        Command::Trade { command } => match command {
-            TradeCommand::Run(args) => handle_trade_run(&ctx, args).await?,
-            TradeCommand::Close(args) => handle_trade_close(&ctx, args).await?,
-        },
+        Command::Trade { command } => trade::dispatch(&ctx, command).await?,
         Command::Monitor { command } => {
             let private_client = ctx.require_private_client(
                 "monitor commands require QF_BINANCE_API_KEY and QF_BINANCE_API_SECRET",
@@ -133,15 +130,6 @@ pub(crate) enum DataCommand {
 
     /// Validate stored candles for duplicates, gaps, ordering, and OHLC sanity.
     Validate(DataValidateArgs),
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum TradeCommand {
-    /// Run the polling strategy bot against SQLite-backed live candles.
-    Run(TradeRunArgs),
-
-    /// Close the bot-managed position with a market sell.
-    Close(TradeCloseArgs),
 }
 
 #[derive(Subcommand, Debug)]

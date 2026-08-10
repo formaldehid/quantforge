@@ -6,8 +6,10 @@
 //! fields were already adjacent and in this order, keeping every command's
 //! `--help` byte-identical to the pre-split output.
 
+use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
-use quantforge::ExecutionMode;
+use quantforge::{BuiltInStrategyConfig, ExchangeId, ExecutionMode, Interval, MarketId, Symbol};
+use rust_decimal::Decimal;
 
 /// `--symbol` for commands without an interval.
 #[derive(Args, Debug)]
@@ -63,5 +65,83 @@ impl From<CliExecutionMode> for ExecutionMode {
             CliExecutionMode::DryRun => ExecutionMode::DryRun,
             CliExecutionMode::Live => ExecutionMode::Live,
         }
+    }
+}
+
+pub(crate) fn parse_market(symbol: String, interval: String) -> Result<MarketId> {
+    let symbol = Symbol::new(symbol)?;
+    let interval = interval.parse::<Interval>()?;
+    Ok(MarketId::new(ExchangeId::BinanceSpot, symbol, interval))
+}
+
+pub(crate) fn parse_positive_decimal(flag: &str, raw: &str) -> Result<Decimal> {
+    let value = raw
+        .trim()
+        .parse::<Decimal>()
+        .with_context(|| format!("failed to parse {flag}: {raw}"))?;
+    if value <= Decimal::ZERO {
+        bail!("{flag} must be greater than 0, got {raw}");
+    }
+    Ok(value)
+}
+
+pub(crate) fn parse_non_negative_decimal(flag: &str, raw: &str) -> Result<Decimal> {
+    let value = raw
+        .trim()
+        .parse::<Decimal>()
+        .with_context(|| format!("failed to parse {flag}: {raw}"))?;
+    if value < Decimal::ZERO {
+        bail!("{flag} must be zero or greater, got {raw}");
+    }
+    Ok(value)
+}
+
+pub(crate) fn strategy_config(fast: usize, slow: usize) -> BuiltInStrategyConfig {
+    BuiltInStrategyConfig::SmaCross { fast, slow }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_decimal_parses_valid_values() {
+        for (raw, expected) in [("100", "100"), ("0.001", "0.001"), (" 10 ", "10")] {
+            let value = parse_positive_decimal("--cash", raw).expect("decimal");
+            assert_eq!(value.to_string(), expected, "for input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn positive_decimal_rejects_zero_and_negative_with_exact_message() {
+        for raw in ["0", "-5"] {
+            let error = parse_positive_decimal("--quote-order-qty", raw).expect_err("error");
+            assert_eq!(
+                error.to_string(),
+                format!("--quote-order-qty must be greater than 0, got {raw}"),
+                "for input {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_negative_decimal_accepts_zero_and_rejects_negative() {
+        let zero = parse_non_negative_decimal("--fee-bps", "0").expect("decimal");
+        assert_eq!(zero, Decimal::ZERO);
+
+        let error = parse_non_negative_decimal("--fee-bps", "-1").expect_err("error");
+        assert_eq!(
+            error.to_string(),
+            "--fee-bps must be zero or greater, got -1"
+        );
+    }
+
+    #[test]
+    fn decimal_helpers_name_the_flag_on_parse_failure() {
+        let error = parse_positive_decimal("--cash", "abc").expect_err("error");
+        assert!(
+            error.to_string().contains("failed to parse --cash: abc"),
+            "got {error:#}"
+        );
     }
 }

@@ -3,7 +3,6 @@
 //! handlers, plus the interactive confirmation helpers.
 
 use super::Cli;
-use super::display_url;
 use anyhow::{Context, Result, anyhow};
 use quantforge::{BinanceCredentials, BinanceSpotClient, CandleStore, SqliteStore};
 use std::io::{self, Write};
@@ -98,6 +97,13 @@ pub(crate) fn prompt_confirmation(prompt: &str) -> Result<bool> {
     Ok(confirmation_is_yes(&input))
 }
 
+pub(crate) fn display_url(url: &Url) -> Url {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    redacted
+}
+
 fn confirmation_is_yes(input: &str) -> bool {
     input.trim().eq_ignore_ascii_case("yes")
 }
@@ -105,6 +111,12 @@ fn confirmation_is_yes(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_url_strips_userinfo() {
+        let url = Url::parse("https://user:secret@api.binance.com/").expect("url");
+        assert_eq!(display_url(&url).as_str(), "https://api.binance.com/");
+    }
 
     #[test]
     fn live_confirmation_accepts_only_yes() {
