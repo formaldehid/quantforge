@@ -1,7 +1,7 @@
-//! Argument structs, handlers, and helpers for the data, backtest, and
-//! monitor commands. Temporary home until their per-command splits
-//! (`cli/data`, `cli/backtest`, `cli/monitor`); trade already lives in
-//! `cli/trade`.
+//! Argument structs, handlers, and helpers for the backtest and monitor
+//! commands. Temporary home until their per-command splits
+//! (`cli/backtest`, `cli/monitor`); data and trade already live in
+//! `cli/data` and `cli/trade`.
 
 use super::common::{
     ConfirmArgs, MarketArgs, PollArgs, StrategyArgs, SymbolArgs, parse_market,
@@ -11,43 +11,13 @@ use super::context::AppContext;
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use quantforge::SqliteStore;
-use quantforge::{BacktestConfig, BacktestEngine, DataSyncConfig, DataSyncEngine};
+use quantforge::{BacktestConfig, BacktestEngine};
 use quantforge::{
     BinanceSpotClient, CandleQuery, CandleStore, MarketDataSource, RunJournalStore, Side, Symbol,
     TradingVenue, ms_to_rfc3339, now_utc_ms, parse_rfc3339_to_ms, round_down_to_step,
-    validate_candles,
 };
 use rust_decimal::Decimal;
 use std::time::Duration;
-
-#[derive(Args, Debug)]
-pub(crate) struct DataSyncArgs {
-    #[command(flatten)]
-    market: MarketArgs,
-    /// RFC3339 start time. Omit to begin syncing from the current time.
-    #[arg(long)]
-    start: Option<String>,
-    /// RFC3339 end time. Omit to keep syncing indefinitely.
-    #[arg(long)]
-    end: Option<String>,
-    #[arg(long, default_value_t = 1000)]
-    limit: u16,
-    /// When --end is set, keep polling until that end boundary is reached.
-    #[arg(long, default_value_t = false)]
-    follow: bool,
-    #[command(flatten)]
-    poll: PollArgs,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct DataValidateArgs {
-    #[command(flatten)]
-    market: MarketArgs,
-    #[arg(long)]
-    start: Option<String>,
-    #[arg(long)]
-    end: Option<String>,
-}
 
 #[derive(Args, Debug)]
 pub(crate) struct BacktestArgs {
@@ -121,93 +91,6 @@ pub(crate) struct MonitorClosePositionArgs {
     symbol: SymbolArgs,
     #[command(flatten)]
     confirm: ConfirmArgs,
-}
-
-pub(crate) async fn handle_data_sync(ctx: &AppContext, args: DataSyncArgs) -> Result<()> {
-    let store = &ctx.store;
-    let client = &ctx.public_client;
-    let market = parse_market(args.market.symbol, args.market.interval)?;
-    let engine = DataSyncEngine::new(client, store);
-    let summary = engine
-        .run(&DataSyncConfig {
-            market,
-            start_time_ms: args
-                .start
-                .as_deref()
-                .map(parse_rfc3339_to_ms)
-                .transpose()
-                .context("failed to parse --start")?,
-            end_time_ms: args
-                .end
-                .as_deref()
-                .map(parse_rfc3339_to_ms)
-                .transpose()
-                .context("failed to parse --end")?,
-            batch_limit: args.limit,
-            follow: args.follow,
-            poll_interval: Duration::from_secs(args.poll.poll_secs),
-            max_loops: args.poll.max_loops,
-        })
-        .await?;
-
-    println!("iterations: {}", summary.iterations);
-    println!("written: {}", summary.written);
-    println!(
-        "first_synced_open_time: {}",
-        summary
-            .first_synced_open_time_ms
-            .map(ms_to_rfc3339)
-            .unwrap_or_else(|| "none".to_string())
-    );
-    println!(
-        "last_open_time: {}",
-        summary
-            .last_open_time_ms
-            .map(ms_to_rfc3339)
-            .unwrap_or_else(|| "none".to_string())
-    );
-    Ok(())
-}
-
-pub(crate) fn handle_data_validate(ctx: &AppContext, args: DataValidateArgs) -> Result<()> {
-    let store = &ctx.store;
-    let market = parse_market(args.market.symbol, args.market.interval)?;
-    let candles = store.load_candles(
-        &market,
-        CandleQuery {
-            start_time_ms: args
-                .start
-                .as_deref()
-                .map(parse_rfc3339_to_ms)
-                .transpose()
-                .context("failed to parse --start")?,
-            end_time_ms: args
-                .end
-                .as_deref()
-                .map(parse_rfc3339_to_ms)
-                .transpose()
-                .context("failed to parse --end")?,
-            limit: None,
-        },
-    )?;
-
-    let report = validate_candles(&market, &candles);
-    println!(
-        "market: {} {} {}",
-        report.market.exchange, report.market.symbol, report.market.interval
-    );
-    println!("candles: {}", report.candle_count);
-    println!("issues: {}", report.issues.len());
-    for (index, issue) in report.issues.iter().take(20).enumerate() {
-        println!("  {:02}: {:?}", index, issue);
-    }
-    if report.issues.len() > 20 {
-        println!("  ... ({} more)", report.issues.len() - 20);
-    }
-    if !report.is_ok() {
-        bail!("data validate found {} issue(s)", report.issues.len());
-    }
-    Ok(())
 }
 
 pub(crate) fn handle_backtest(ctx: &AppContext, args: BacktestArgs) -> Result<()> {

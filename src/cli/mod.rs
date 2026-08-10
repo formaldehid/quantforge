@@ -1,5 +1,7 @@
-//! Command-line interface: the root parser, the command tree, and (until
-//! the per-command split) every argument struct and handler.
+//! Command-line interface: the root parser, the command tree, and the
+//! `run()` dispatch. Each command group owns a module mirroring its
+//! command path (`data`, `trade`); `commands` is the temporary home for
+//! the groups whose splits are still pending.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -8,6 +10,7 @@ use std::path::PathBuf;
 mod commands;
 mod common;
 mod context;
+mod data;
 mod trade;
 
 use context::AppContext;
@@ -15,14 +18,14 @@ use context::AppContext;
 // Args types are only named by the Command enum below; the handlers are
 // dispatched by run().
 use commands::{
-    BacktestArgs, DataSyncArgs, DataValidateArgs, MonitorCancelOrderArgs, MonitorClosePositionArgs,
-    MonitorOrdersArgs, MonitorStatusArgs, MonitorTradesArgs, MonitorWatchArgs,
+    BacktestArgs, MonitorCancelOrderArgs, MonitorClosePositionArgs, MonitorOrdersArgs,
+    MonitorStatusArgs, MonitorTradesArgs, MonitorWatchArgs,
 };
 use commands::{
-    handle_backtest, handle_data_sync, handle_data_validate, handle_monitor_cancel_order,
-    handle_monitor_close_position, handle_monitor_orders, handle_monitor_status,
-    handle_monitor_trades, handle_monitor_watch,
+    handle_backtest, handle_monitor_cancel_order, handle_monitor_close_position,
+    handle_monitor_orders, handle_monitor_status, handle_monitor_trades, handle_monitor_watch,
 };
+use data::DataCommand;
 use trade::TradeCommand;
 
 /// Build the per-invocation context and dispatch the parsed command.
@@ -30,10 +33,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     let ctx = AppContext::init(&cli)?;
 
     match cli.command {
-        Command::Data { command } => match command {
-            DataCommand::Sync(args) => handle_data_sync(&ctx, args).await?,
-            DataCommand::Validate(args) => handle_data_validate(&ctx, args)?,
-        },
+        Command::Data { command } => data::dispatch(&ctx, command).await?,
         Command::Backtest(args) => handle_backtest(&ctx, args)?,
         Command::Trade { command } => trade::dispatch(&ctx, command).await?,
         Command::Monitor { command } => {
@@ -121,15 +121,6 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: MonitorCommand,
     },
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum DataCommand {
-    /// Sync candles from Binance into SQLite.
-    Sync(DataSyncArgs),
-
-    /// Validate stored candles for duplicates, gaps, ordering, and OHLC sanity.
-    Validate(DataValidateArgs),
 }
 
 #[derive(Subcommand, Debug)]
