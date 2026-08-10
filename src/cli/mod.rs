@@ -2,11 +2,11 @@
 //! the per-command split) every argument struct and handler.
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
-use quantforge::ExecutionMode;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
+mod common;
 mod context;
 
 use context::AppContext;
@@ -163,21 +163,4 @@ pub(crate) enum MonitorCommand {
 
     /// Close the current free base-asset balance for the symbol.
     ClosePosition(MonitorClosePositionArgs),
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum CliExecutionMode {
-    #[value(name = "dry-run")]
-    DryRun,
-    #[value(name = "live")]
-    Live,
-}
-
-impl From<CliExecutionMode> for ExecutionMode {
-    fn from(value: CliExecutionMode) -> Self {
-        match value {
-            CliExecutionMode::DryRun => ExecutionMode::DryRun,
-            CliExecutionMode::Live => ExecutionMode::Live,
-        }
-    }
 }
