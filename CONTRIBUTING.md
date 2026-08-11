@@ -44,6 +44,18 @@ otherwise they skip with a `SKIP (testnet tier)` marker on stderr. Run one
 tier alone with `cargo test --test e2e offline::` or
 `cargo test --test e2e testnet::`.
 
+## CLI snapshots
+
+The `--help` output of every command is locked by committed snapshots in
+`tests/snapshots/`, alongside a clap self-check and a test that the module
+tree mirrors the command tree. A renamed flag, a changed default, or a
+reordered argument fails CI. After an intentional change to the CLI
+surface, refresh the snapshots and review the diff:
+
+```bash
+UPDATE_SNAPSHOTS=1 cargo test --test e2e snapshot::
+```
+
 ## Security and secrets
 
 Do not commit API keys, secrets, `.env` files, or production credentials.

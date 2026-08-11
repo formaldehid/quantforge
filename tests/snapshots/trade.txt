@@ -1,0 +1,18 @@
+Run or manually close the strategy bot
+
+Usage: quantforge trade [OPTIONS] <COMMAND>
+
+Commands:
+  run    Run the polling strategy bot against SQLite-backed live candles
+  close  Close the bot-managed position with a market sell
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --db <DB>
+          SQLite database path [env: QF_DB=] [default: data/market.sqlite]
+      --binance-base-url <BINANCE_BASE_URL>
+          Binance API base URL. Use https://testnet.binance.vision/ for Spot testnet [env: QF_BINANCE_BASE_URL=] [default: https://api.binance.com/]
+      --log-level <LOG_LEVEL>
+          Log filter (trace, debug, info, warn, error or a full tracing filter expression) [env: QF_LOG=] [default: info]
+  -h, --help
+          Print help
