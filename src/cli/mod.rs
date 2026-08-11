@@ -1,12 +1,13 @@
 //! Command-line interface: the root parser, the command tree, and the
 //! `run()` dispatch. Each command group owns a module mirroring its
-//! command path (`data`, `trade`); `commands` is the temporary home for
-//! the groups whose splits are still pending.
+//! command path (`backtest`, `data`, `trade`); `commands` is the
+//! temporary home for the groups whose splits are still pending.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod backtest;
 mod commands;
 mod common;
 mod context;
@@ -17,13 +18,14 @@ use context::AppContext;
 
 // Args types are only named by the Command enum below; the handlers are
 // dispatched by run().
+use backtest::{BacktestArgs, handle_backtest};
 use commands::{
-    BacktestArgs, MonitorCancelOrderArgs, MonitorClosePositionArgs, MonitorOrdersArgs,
-    MonitorStatusArgs, MonitorTradesArgs, MonitorWatchArgs,
+    MonitorCancelOrderArgs, MonitorClosePositionArgs, MonitorOrdersArgs, MonitorStatusArgs,
+    MonitorTradesArgs, MonitorWatchArgs,
 };
 use commands::{
-    handle_backtest, handle_monitor_cancel_order, handle_monitor_close_position,
-    handle_monitor_orders, handle_monitor_status, handle_monitor_trades, handle_monitor_watch,
+    handle_monitor_cancel_order, handle_monitor_close_position, handle_monitor_orders,
+    handle_monitor_status, handle_monitor_trades, handle_monitor_watch,
 };
 use data::DataCommand;
 use trade::TradeCommand;

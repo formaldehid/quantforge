@@ -1,41 +1,17 @@
-//! Argument structs, handlers, and helpers for the backtest and monitor
-//! commands. Temporary home until their per-command splits
-//! (`cli/backtest`, `cli/monitor`); data and trade already live in
-//! `cli/data` and `cli/trade`.
+//! Argument structs, handlers, and helpers for the monitor commands.
+//! Temporary home until the monitor split (`cli/monitor`); data,
+//! backtest, and trade already live in their own command modules.
 
-use super::common::{
-    ConfirmArgs, MarketArgs, PollArgs, StrategyArgs, SymbolArgs, parse_market,
-    parse_non_negative_decimal, parse_positive_decimal, strategy_config,
-};
-use super::context::AppContext;
-use anyhow::{Context, Result, bail};
+use super::common::{ConfirmArgs, MarketArgs, PollArgs, StrategyArgs, SymbolArgs, parse_market};
+use anyhow::{Result, bail};
 use clap::Args;
 use quantforge::SqliteStore;
-use quantforge::{BacktestConfig, BacktestEngine};
 use quantforge::{
-    BinanceSpotClient, CandleQuery, CandleStore, MarketDataSource, RunJournalStore, Side, Symbol,
-    TradingVenue, ms_to_rfc3339, now_utc_ms, parse_rfc3339_to_ms, round_down_to_step,
+    BinanceSpotClient, MarketDataSource, RunJournalStore, Side, Symbol, TradingVenue,
+    ms_to_rfc3339, now_utc_ms, round_down_to_step,
 };
 use rust_decimal::Decimal;
 use std::time::Duration;
-
-#[derive(Args, Debug)]
-pub(crate) struct BacktestArgs {
-    #[command(flatten)]
-    market: MarketArgs,
-    #[arg(long)]
-    start: Option<String>,
-    #[arg(long)]
-    end: Option<String>,
-    #[arg(long, default_value_t = 20)]
-    fast: usize,
-    #[arg(long, default_value_t = 50)]
-    slow: usize,
-    #[arg(long, default_value = "10000")]
-    cash: String,
-    #[arg(long, default_value = "10")]
-    fee_bps: String,
-}
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitorStatusArgs {
@@ -91,59 +67,6 @@ pub(crate) struct MonitorClosePositionArgs {
     symbol: SymbolArgs,
     #[command(flatten)]
     confirm: ConfirmArgs,
-}
-
-pub(crate) fn handle_backtest(ctx: &AppContext, args: BacktestArgs) -> Result<()> {
-    let store = &ctx.store;
-    let market = parse_market(args.market.symbol, args.market.interval)?;
-    let initial_cash = parse_positive_decimal("--cash", &args.cash)?;
-    let fee_bps = parse_non_negative_decimal("--fee-bps", &args.fee_bps)?;
-    let candles = store.load_candles(
-        &market,
-        CandleQuery {
-            start_time_ms: args
-                .start
-                .as_deref()
-                .map(parse_rfc3339_to_ms)
-                .transpose()
-                .context("failed to parse --start")?,
-            end_time_ms: args
-                .end
-                .as_deref()
-                .map(parse_rfc3339_to_ms)
-                .transpose()
-                .context("failed to parse --end")?,
-            limit: None,
-        },
-    )?;
-
-    let mut strategy = strategy_config(args.fast, args.slow)
-        .build()
-        .context("failed to build strategy")?;
-    let engine = BacktestEngine::new(BacktestConfig {
-        initial_cash,
-        fee_bps,
-        close_out_at_end: true,
-    });
-
-    let result = engine.run(&market, &candles, strategy.as_mut())?;
-    println!("strategy: {}", strategy.name());
-    println!("final_equity: {}", result.final_equity);
-    println!("total_return_pct: {}", result.total_return_pct);
-    println!("max_drawdown_pct: {}", result.max_drawdown_pct);
-    println!("trade_count: {}", result.trade_count);
-    for trade in result.trades.iter().rev().take(5).rev() {
-        println!(
-            "trade: entry={} @ {} exit={} @ {} qty={} gross_pnl={}",
-            trade.entry_time_ms,
-            trade.entry_price,
-            trade.exit_time_ms,
-            trade.exit_price,
-            trade.qty,
-            trade.gross_quote_pnl
-        );
-    }
-    Ok(())
 }
 
 pub(crate) async fn handle_monitor_status(
