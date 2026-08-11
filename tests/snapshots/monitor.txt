@@ -1,0 +1,22 @@
+Observe Binance state and manage orders manually when needed
+
+Usage: quantforge monitor [OPTIONS] <COMMAND>
+
+Commands:
+  status          Print balances, latest run state, open orders, and recent trades
+  watch           Poll status repeatedly
+  orders          List current open orders on the symbol
+  trades          List recent Binance trades on the symbol
+  cancel-order    Cancel a specific order manually
+  close-position  Close the current free base-asset balance for the symbol
+  help            Print this message or the help of the given subcommand(s)
+
+Options:
+      --db <DB>
+          SQLite database path [env: QF_DB=] [default: data/market.sqlite]
+      --binance-base-url <BINANCE_BASE_URL>
+          Binance API base URL. Use https://testnet.binance.vision/ for Spot testnet [env: QF_BINANCE_BASE_URL=] [default: https://api.binance.com/]
+      --log-level <LOG_LEVEL>
+          Log filter (trace, debug, info, warn, error or a full tracing filter expression) [env: QF_LOG=] [default: info]
+  -h, --help
+          Print help

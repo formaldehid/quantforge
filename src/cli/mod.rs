@@ -101,3 +101,17 @@ pub(crate) enum Command {
         command: MonitorCommand,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    // clap's own consistency self-check: duplicate flags or ids, broken
+    // defaults, and malformed value parsers panic here rather than at the
+    // first user invocation.
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+}

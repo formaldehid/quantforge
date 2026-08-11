@@ -1,0 +1,39 @@
+Run the polling strategy bot against SQLite-backed live candles
+
+Usage: quantforge trade run [OPTIONS] --symbol <SYMBOL>
+
+Options:
+      --db <DB>
+          SQLite database path [env: QF_DB=] [default: data/market.sqlite]
+      --symbol <SYMBOL>
+          
+      --binance-base-url <BINANCE_BASE_URL>
+          Binance API base URL. Use https://testnet.binance.vision/ for Spot testnet [env: QF_BINANCE_BASE_URL=] [default: https://api.binance.com/]
+      --interval <INTERVAL>
+          [default: 1m]
+      --fast <FAST>
+          [default: 20]
+      --log-level <LOG_LEVEL>
+          Log filter (trace, debug, info, warn, error or a full tracing filter expression) [env: QF_LOG=] [default: info]
+      --slow <SLOW>
+          [default: 50]
+      --quote-order-qty <QUOTE_ORDER_QTY>
+          [default: 100]
+      --mode <MODE>
+          [default: dry-run] [possible values: dry-run, live]
+      --yes
+          
+      --poll-secs <POLL_SECS>
+          [default: 5]
+      --bootstrap-bars <BOOTSTRAP_BARS>
+          [default: 300]
+      --bootstrap-enter
+          
+      --limit <LIMIT>
+          [default: 1000]
+      --run-id <RUN_ID>
+          
+      --max-loops <MAX_LOOPS>
+          
+  -h, --help
+          Print help

@@ -5,6 +5,9 @@
 //! - `testnet`: real Binance Spot testnet; skips with a stderr marker
 //!   unless `QF_BINANCE_API_KEY`/`QF_BINANCE_API_SECRET` are exported
 //!
+//! [`snapshot`] locks the CLI surface itself: committed `--help`
+//! snapshots plus a check that the module tree mirrors the command tree.
+//!
 //! Shared infrastructure lives in [`harness`]: the env-isolated
 //! `assert_cmd` runner, per-test temp databases, `key: value` output
 //! parsing, and the tier gate.
@@ -15,4 +18,5 @@
 mod harness;
 mod mock_binance;
 mod offline;
+mod snapshot;
 mod testnet;

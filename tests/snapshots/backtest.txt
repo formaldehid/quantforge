@@ -1,0 +1,29 @@
+Deterministic backtest using locally stored candles
+
+Usage: quantforge backtest [OPTIONS] --symbol <SYMBOL>
+
+Options:
+      --db <DB>
+          SQLite database path [env: QF_DB=] [default: data/market.sqlite]
+      --symbol <SYMBOL>
+          
+      --binance-base-url <BINANCE_BASE_URL>
+          Binance API base URL. Use https://testnet.binance.vision/ for Spot testnet [env: QF_BINANCE_BASE_URL=] [default: https://api.binance.com/]
+      --interval <INTERVAL>
+          [default: 1m]
+      --log-level <LOG_LEVEL>
+          Log filter (trace, debug, info, warn, error or a full tracing filter expression) [env: QF_LOG=] [default: info]
+      --start <START>
+          
+      --end <END>
+          
+      --fast <FAST>
+          [default: 20]
+      --slow <SLOW>
+          [default: 50]
+      --cash <CASH>
+          [default: 10000]
+      --fee-bps <FEE_BPS>
+          [default: 10]
+  -h, --help
+          Print help
