@@ -1,10 +1,9 @@
 //! `quantforge trade close` — manual position exit with the confirmation
 //! flow, journal-deferral ordering, and dust write-off rules.
 
-// Shared with the monitor handlers; they find a final home when the
-// monitor split (ALG-491) lands.
-use crate::cli::commands::{print_order, round_quantity_for_rules};
-use crate::cli::common::{ConfirmArgs, MarketArgs, StrategyArgs, parse_market};
+use crate::cli::common::{
+    ConfirmArgs, MarketArgs, StrategyArgs, parse_market, print_order, round_quantity_for_rules,
+};
 use crate::cli::context::AppContext;
 use anyhow::{Result, anyhow, bail};
 use clap::Args;

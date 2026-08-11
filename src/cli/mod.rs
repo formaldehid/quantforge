@@ -1,17 +1,16 @@
 //! Command-line interface: the root parser, the command tree, and the
 //! `run()` dispatch. Each command group owns a module mirroring its
-//! command path (`backtest`, `data`, `trade`); `commands` is the
-//! temporary home for the groups whose splits are still pending.
+//! command path (`backtest`, `data`, `monitor`, `trade`).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod backtest;
-mod commands;
 mod common;
 mod context;
 mod data;
+mod monitor;
 mod trade;
 
 use context::AppContext;
@@ -19,15 +18,8 @@ use context::AppContext;
 // Args types are only named by the Command enum below; the handlers are
 // dispatched by run().
 use backtest::{BacktestArgs, handle_backtest};
-use commands::{
-    MonitorCancelOrderArgs, MonitorClosePositionArgs, MonitorOrdersArgs, MonitorStatusArgs,
-    MonitorTradesArgs, MonitorWatchArgs,
-};
-use commands::{
-    handle_monitor_cancel_order, handle_monitor_close_position, handle_monitor_orders,
-    handle_monitor_status, handle_monitor_trades, handle_monitor_watch,
-};
 use data::DataCommand;
+use monitor::MonitorCommand;
 use trade::TradeCommand;
 
 /// Build the per-invocation context and dispatch the parsed command.
@@ -42,22 +34,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             let private_client = ctx.require_private_client(
                 "monitor commands require QF_BINANCE_API_KEY and QF_BINANCE_API_SECRET",
             )?;
-            match command {
-                MonitorCommand::Status(args) => {
-                    handle_monitor_status(&ctx.store, private_client, args).await?
-                }
-                MonitorCommand::Watch(args) => {
-                    handle_monitor_watch(&ctx.store, private_client, args).await?
-                }
-                MonitorCommand::Orders(args) => handle_monitor_orders(private_client, args).await?,
-                MonitorCommand::Trades(args) => handle_monitor_trades(private_client, args).await?,
-                MonitorCommand::CancelOrder(args) => {
-                    handle_monitor_cancel_order(private_client, args).await?
-                }
-                MonitorCommand::ClosePosition(args) => {
-                    handle_monitor_close_position(private_client, args).await?
-                }
-            }
+            monitor::dispatch(&ctx.store, private_client, command).await?
         }
     }
 
@@ -123,25 +100,4 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: MonitorCommand,
     },
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum MonitorCommand {
-    /// Print balances, latest run state, open orders, and recent trades.
-    Status(MonitorStatusArgs),
-
-    /// Poll status repeatedly.
-    Watch(MonitorWatchArgs),
-
-    /// List current open orders on the symbol.
-    Orders(MonitorOrdersArgs),
-
-    /// List recent Binance trades on the symbol.
-    Trades(MonitorTradesArgs),
-
-    /// Cancel a specific order manually.
-    CancelOrder(MonitorCancelOrderArgs),
-
-    /// Close the current free base-asset balance for the symbol.
-    ClosePosition(MonitorClosePositionArgs),
 }
