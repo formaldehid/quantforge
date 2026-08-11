@@ -1,5 +1,5 @@
-//! Shared argument structs for `#[command(flatten)]`, plus the CLI
-//! execution-mode enum.
+//! Shared argument structs for `#[command(flatten)]`, the CLI
+//! execution-mode enum, and helpers used across command modules.
 //!
 //! clap splices a flattened struct's args into the parent at the flatten
 //! position, in declaration order — so a group is only flattened where its
@@ -8,7 +8,10 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
-use quantforge::{BuiltInStrategyConfig, ExchangeId, ExecutionMode, Interval, MarketId, Symbol};
+use quantforge::{
+    BuiltInStrategyConfig, ExchangeId, ExecutionMode, Interval, MarketId, Symbol,
+    round_down_to_step,
+};
 use rust_decimal::Decimal;
 
 /// `--symbol` for commands without an interval.
@@ -98,6 +101,32 @@ pub(crate) fn parse_non_negative_decimal(flag: &str, raw: &str) -> Result<Decima
 
 pub(crate) fn strategy_config(fast: usize, slow: usize) -> BuiltInStrategyConfig {
     BuiltInStrategyConfig::SmaCross { fast, slow }
+}
+
+pub(crate) fn round_quantity_for_rules(qty: Decimal, rules: &quantforge::SymbolRules) -> Decimal {
+    match rules.effective_market_step_size() {
+        Some(step_size) => round_down_to_step(qty, step_size),
+        None => qty,
+    }
+}
+
+pub(crate) fn print_order(order: &quantforge::ExchangeOrder) {
+    let display_decimal = |value: Option<Decimal>| {
+        value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    println!(
+        "order: id={:?} client_id={:?} symbol={} side={} status={} executed_qty={} cumulative_quote_qty={} avg_price={}",
+        order.order_id,
+        order.client_order_id,
+        order.symbol,
+        order.side,
+        order.status.as_str(),
+        display_decimal(order.executed_qty),
+        display_decimal(order.cumulative_quote_qty),
+        display_decimal(order.average_price())
+    );
 }
 
 #[cfg(test)]
