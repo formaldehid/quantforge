@@ -4,5 +4,4 @@
 
 pub mod binance;
 
-pub use crate::ports::ExchangeError;
 pub use binance::{BinanceCredentials, BinanceSpotClient};
