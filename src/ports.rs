@@ -1,3 +1,11 @@
+//! The seams every adapter plugs into: [`MarketDataSource`] and
+//! [`TradingVenue`] are what a venue must provide, [`CandleStore`] and
+//! [`RunJournalStore`] what a persistence backend must, and
+//! [`ExchangeError`] and [`StorageError`] are the two failure channels an
+//! engine folds into its own. One flat file on purpose — the four traits
+//! share the request types in this file, so splitting them would only buy
+//! imports.
+
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use std::error::Error as StdError;
