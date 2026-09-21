@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- the `sdk` module is split into `sdk::strategy` (the `Strategy` trait and its `StrategyContext` snapshot), `sdk::indicators`, and `sdk::builtin`, with `StrategyError` staying on `sdk` itself; crate-root re-exports such as `quantforge::Strategy` and `quantforge::SmaCrossStrategy` are unchanged, but the path import `quantforge::sdk::strategies::SmaCrossStrategy` becomes `quantforge::sdk::builtin::SmaCrossStrategy`
 - gitleaks scanning runs the MIT-licensed gitleaks cli directly instead of `gitleaks-action`, which refuses to run for organization-owned repositories without a license key, and uploads its findings to the Security tab as sarif
 - the `repository` and `homepage` links point at `quantforge-rs/quantforge` after the repository moved out of a personal account
 - the `backtest`, `data_sync`, and `live` modules moved under `engine`; crate-root re-exports such as `quantforge::LiveTradeEngine` are unchanged, but path imports like `quantforge::live::LiveTradeConfig` become `quantforge::engine::live::LiveTradeConfig`

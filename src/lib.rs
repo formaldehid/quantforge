@@ -25,7 +25,7 @@ pub use ports::{
     MarketOrderRequest, OrderQueryRequest, RunJournalStore, StorageError, TradingVenue,
 };
 pub use sdk::{
-    BuiltInStrategyConfig, Indicator, Sma, Strategy, StrategyContext, StrategyError,
-    strategies::SmaCrossStrategy,
+    BuiltInStrategyConfig, Indicator, Sma, SmaCrossStrategy, Strategy, StrategyContext,
+    StrategyError,
 };
 pub use storage::SqliteStore;
