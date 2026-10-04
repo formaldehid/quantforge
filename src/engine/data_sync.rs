@@ -1,3 +1,8 @@
+//! Historical and incremental candle ingestion: pulls klines from a
+//! [`MarketDataSource`] in bounded batches, writes them to a [`CandleStore`],
+//! and optionally follows the tail. The range helpers below are `pub(crate)`
+//! — [`live`](super::live) drives them to keep its own poll loop fed.
+
 use crate::EngineError;
 use crate::{CandleStore, KlineRequest, MarketDataSource, MarketId, now_utc_ms};
 use std::time::Duration;

@@ -1,5 +1,6 @@
 //! Strategies that ship with the crate, and the [`BuiltInStrategyConfig`]
-//! that names and constructs one. [`sma_cross`] is the only entry today.
+//! that names and constructs one. [`SmaCrossStrategy`] is the only entry
+//! today, and its module is private.
 //!
 //! Self-contained on purpose: nothing outside this directory reaches into a
 //! built-in strategy's internals, so the whole namespace can be extended or

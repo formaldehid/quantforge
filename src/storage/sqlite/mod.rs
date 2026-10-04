@@ -1,7 +1,8 @@
 //! SQLite-backed store: connection setup, schema initialization, and the
 //! row-decoding helpers shared by both responsibilities. The work is split
-//! across sibling modules — [`candles`] implements `CandleStore`,
-//! [`journal`] implements `RunJournalStore`.
+//! across private sibling modules — `candles` implements `CandleStore`,
+//! `journal` implements `RunJournalStore`. Only [`SqliteStore`] leaves this
+//! namespace; the schema and the row decoders are not API.
 
 mod candles;
 mod journal;

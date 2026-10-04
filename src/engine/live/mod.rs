@@ -1,7 +1,8 @@
 //! Polling live/dry-run trading engine: public surface and the run
-//! lifecycle. The work is split across sibling modules — [`runner`] owns
-//! the poll loop, [`execution`] places orders, [`state`] owns run-state
-//! identity and resume checks.
+//! lifecycle. The work is split across private sibling modules — `runner`
+//! owns the poll loop, `execution` places orders, `state` owns run-state
+//! identity and resume checks. Only [`LiveTradeConfig`], [`LiveTradeEngine`]
+//! and [`LiveTradeSummary`] leave this namespace.
 
 mod execution;
 mod runner;

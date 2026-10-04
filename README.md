@@ -32,16 +32,14 @@ recommend trades, and does not promise profitability.
 This repository stays as a single Cargo package in `0.2.0` so versioning,
 publishing, installation, and contributor onboarding remain simple.
 
-Internal boundaries still exist as Rust modules:
+The public surface is layered as Rust modules, innermost first:
 
-- `model` - normalized market types and validation
-- `ports` - exchange and storage traits plus request types
-- `exchange` - Binance Spot REST client
-- `storage` - SQLite candle store and bot journal
-- `sdk` - strategy trait, indicators, built-in strategies
-- `backtest` - deterministic bar-by-bar engine
-- `data_sync` - historical and incremental ingestion loop
-- `live` - polling live-trade engine
+- `model` - normalized market types, validation, timestamp and decimal helpers
+- `ports` - the exchange and storage traits every adapter implements, plus request types
+- `exchange` - venue adapters, one namespace per venue; `binance` is the only one today
+- `storage` - persistence adapters, one namespace per backend; `sqlite` is the only one
+- `sdk` - the strategy trait and its context, indicator math, and built-in strategies
+- `engine` - the drivers: `engine::backtest`, `engine::data_sync`, and `engine::live`
 
 ## Scope and guardrails
 

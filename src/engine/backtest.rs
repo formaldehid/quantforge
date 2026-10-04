@@ -1,3 +1,7 @@
+//! Deterministic bar-by-bar backtest: replays a candle slice through a
+//! [`Strategy`] and executes each intent at the next bar's open, so a fill
+//! can never use information the strategy had not seen.
+
 use crate::{
     Candle, ClosedTrade, MarketId, Strategy, StrategyContext, TargetPosition, TimestampMs,
 };
